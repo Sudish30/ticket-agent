@@ -108,6 +108,11 @@ python -m uvicorn quorum_backend.server:app --port 8000
 open http://localhost:8000
 ```
 
-Flow: **New ticket** → **Tickets** → expand → **Solve ticket** → the agent posts grounded questions in the Clarification
-thread → reply as the reporter → the agent posts its sign-off → reply `confirm` → status **Brief ready** and the
-Markdown brief (`TaskBrief.to_markdown()`) appears on the ticket.
+Flow: **New ticket** → the intake agent starts automatically (status **Clarifying**) and posts grounded questions in the
+ticket's Clarification thread → reply as the reporter → the agent posts its sign-off → reply `confirm` → status
+**Brief ready**.
+
+The topbar **View as** toggle (remembered in `localStorage` as `quorum-role`, default Reporter) picks the lens:
+- **Reporter** — ticket details, the Clarification thread and the reply box. No solving controls, no brief, no Solutions tab.
+- **Engineer** — everything, read-only thread, the Markdown brief (`TaskBrief.to_markdown()`), and **Start solving** once
+  the status is **Brief ready**. After an **Agent error**, **Retry agent** calls `POST /solve` to run the intake again.

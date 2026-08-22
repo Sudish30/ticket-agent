@@ -128,8 +128,11 @@ so swapping the human-in-the-loop transport never touches the graph.
 `python -m uvicorn quorum_backend.server:app --port 8000` from the repo root. Routes: `GET/POST /api/tickets`,
 `GET /api/tickets/{key}`, `POST …/comments {author, body}`, `POST …/status/{status}`, `POST …/solve`; `/` and
 static files come from `QUORUM_UI_DIR` (default `../Quorum`, the `wire-intake-agent` checkout whose `app.js` is
-wired to these routes and polls every 3 s). `/solve` flips status `Ready → Clarifying` and starts `_run_agent` in a
-daemon thread, which calls `run(ticket, JiraCommentChannel(FakeJiraClient("http://127.0.0.1:8000"), poll 2 s), repo=TICKET_AGENT_REPO)`
+wired to these routes and polls every 3 s; its topbar **View as** toggle — Reporter / Engineer, `localStorage`
+`quorum-role` — hides solving controls, the brief and the Solutions tab from reporters, and the reply box from
+engineers). `POST /api/tickets` saves the ticket with status `Clarifying` and immediately starts `_run_agent` in a
+daemon thread (`_start_agent`); `POST …/solve` is only a manual retry, accepted when status is `Agent error` (or legacy
+`Ready`), else 409. `_run_agent` calls `run(ticket, JiraCommentChannel(FakeJiraClient("http://127.0.0.1:8000"), poll 2 s), repo=TICKET_AGENT_REPO)`
 — i.e. the agent talks to its own server over HTTP, posting questions as comments by `JIRA_AGENT_NAME` and waiting for
 any other author's comment. On success: status `Brief ready`, `brief` (dict) + `brief_md` (`to_markdown()`) stored on
 the ticket and the markdown posted as a final comment; on exception: status `Agent error` with the message.

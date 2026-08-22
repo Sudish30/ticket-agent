@@ -3,6 +3,8 @@
     python -m uvicorn quorum_backend.server:app --port 8000
     open http://localhost:8000
 
+Creating a ticket starts the intake agent immediately (status "Clarifying"); POST /solve is a manual retry.
+
 Env: ANTHROPIC_API_KEY (required), TICKET_AGENT_REPO (default: demo_repo), QUORUM_UI_DIR (default: ../Quorum)
 """
 from __future__ import annotations
@@ -81,10 +83,13 @@ def create_ticket(t: NewTicket):
             "key": key, "summary": t.title, "description": t.description, "reporter": t.reporter,
             "repository": t.repository, "issue_type": t.issue_type, "priority": t.priority,
             "assignee": "", "labels": [], "components": [], "linked_issues": [], "epic": "",
-            "status": "Ready", "created": datetime.now().isoformat(timespec="seconds"),
+            "status": "Clarifying", "created": datetime.now().isoformat(timespec="seconds"),
             "comments": [], "brief": None, "brief_md": "", "error": "",
         }
-        _save(d); return d["tickets"][key]
+        _save(d)
+    # The intake agent starts automatically on creation; /solve stays as a manual retry after "Agent error".
+    _start_agent(key)
+    return _get(key)
 
 @app.get("/api/tickets/{key}")
 def get_ticket(key: str):
@@ -119,13 +124,18 @@ def _run_agent(key: str) -> None:
         traceback.print_exc()
         _update(key, status="Agent error", error=f"{type(e).__name__}: {e}")
 
+def _start_agent(key: str) -> None:
+    threading.Thread(target=_run_agent, args=(key,), daemon=True).start()
+
 @app.post("/api/tickets/{key}/solve")
 def solve(key: str):
+    """Manual retry. New tickets start the agent automatically; this re-runs it after "Agent error"
+    (or for legacy tickets still in "Ready")."""
     t = _get(key)
     if t["status"] not in ("Ready", "Agent error"):
         raise HTTPException(409, f"ticket is {t['status']}")
     _update(key, status="Clarifying", error="")
-    threading.Thread(target=_run_agent, args=(key,), daemon=True).start()
+    _start_agent(key)
     return {"ok": True, "status": "Clarifying"}
 
 

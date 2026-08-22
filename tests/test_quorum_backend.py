@@ -1,5 +1,9 @@
-"""quorum_backend.server routes + FakeJiraClient, through FastAPI's TestClient. No network, no LLM, temp store."""
+"""quorum_backend.server routes + FakeJiraClient, through FastAPI's TestClient. No network, no LLM, temp store.
+
+_run_agent is patched out: creating a ticket starts it in a thread, and the real one calls the model.
+"""
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -32,16 +36,44 @@ class QuorumBackend(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self._db = patch.object(server, "DB", Path(self.tmp.name) / "tickets.json")
         self._db.start()
+        self._agent = patch.object(server, "_run_agent")
+        self.run_agent = self._agent.start()
         self.tc = TestClient(server.app)
 
     def tearDown(self):
+        self._agent.stop()
         self._db.stop()
         self.tmp.cleanup()
+
+    def _wait_for_agent_calls(self, n: int) -> None:
+        for _ in range(300):                      # the agent is started on a daemon thread
+            if self.run_agent.call_count >= n:
+                return
+            time.sleep(0.01)
+        self.fail(f"_run_agent called {self.run_agent.call_count} times, expected {n}")
+
+    def test_create_starts_the_agent_and_sets_clarifying(self):
+        t = self.tc.post("/api/tickets", json={"title": "Reset link never works", "reporter": "Priya"}).json()
+        self.assertEqual((t["key"], t["status"], t["error"]), ("QT-001", "Clarifying", ""))
+        self._wait_for_agent_calls(1)
+        self.run_agent.assert_called_once_with("QT-001")
+        self.assertEqual(self.tc.get("/api/tickets/QT-001").json()["status"], "Clarifying")
+
+    def test_solve_is_only_a_retry(self):
+        self.assertEqual(self.tc.post("/api/tickets/QT-404/solve").status_code, 404)
+        self.tc.post("/api/tickets", json={"title": "t"})
+        self._wait_for_agent_calls(1)
+        self.assertEqual(self.tc.post("/api/tickets/QT-001/solve").status_code, 409)     # already clarifying
+        self.tc.post("/api/tickets/QT-001/status/Agent%20error")
+        r = self.tc.post("/api/tickets/QT-001/solve")
+        self.assertEqual((r.status_code, r.json()["status"]), (200, "Clarifying"))
+        self._wait_for_agent_calls(2)
+        self.assertEqual(self.run_agent.call_args.args, ("QT-001",))
 
     def test_ticket_lifecycle_through_fake_jira_client(self):
         self.assertEqual(self.tc.get("/api/tickets").json(), [])
         t = self.tc.post("/api/tickets", json={"title": "Reset link never works", "description": "d", "reporter": "Priya"}).json()
-        self.assertEqual((t["key"], t["status"], t["comments"]), ("QT-001", "Ready", []))
+        self.assertEqual((t["key"], t["comments"]), ("QT-001", []))
         self.tc.post("/api/tickets/QT-001/comments", json={"author": "Dan", "body": "timing thing?"})
 
         with patch("ticket_agent.jira_client.requests", _RequestsShim(self.tc)):
@@ -56,12 +88,6 @@ class QuorumBackend(unittest.TestCase):
             client.transition("QT-001", "Brief ready")
         self.assertEqual(self.tc.get("/api/tickets/QT-001").json()["status"], "Brief ready")
         self.assertEqual(self.tc.get("/api/tickets/nope").status_code, 404)
-
-    def test_solve_rejects_unknown_and_busy_tickets(self):
-        self.assertEqual(self.tc.post("/api/tickets/QT-404/solve").status_code, 404)
-        self.tc.post("/api/tickets", json={"title": "t"})
-        self.tc.post("/api/tickets/QT-001/status/Clarifying")
-        self.assertEqual(self.tc.post("/api/tickets/QT-001/solve").status_code, 409)   # already running
 
     @unittest.skipUnless(server.UI_DIR.is_dir(), "Quorum UI checkout not present next to this repo")
     def test_serves_the_quorum_ui(self):
