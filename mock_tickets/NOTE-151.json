@@ -1,0 +1,10 @@
+{
+  "key": "NOTE-151",
+  "summary": "Signup says my email is invalid",
+  "description": "A customer emailed saying they can't sign up, it tells them their email looks invalid but it's a normal gmail address. Screenshot attached (not really).",
+  "issue_type": "Bug", "priority": "Medium", "labels": ["signup"], "components": ["notely"],
+  "reporter": "Marcus", "assignee": "", "linked_issues": [], "epic": "",
+  "comments": [
+    {"author": "Marcus", "created": "2026-08-21", "body": "Their address was something like firstname+notely@gmail.com if that matters."}
+  ]
+}

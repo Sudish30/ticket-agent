@@ -1,0 +1,18 @@
+{
+  "key": "PROJ-142",
+  "summary": "Login times out for some users",
+  "description": "Some users are reporting that they get logged out randomly. Started after the last release. Please fix asap.",
+  "issue_type": "Bug",
+  "priority": "High",
+  "labels": ["auth"],
+  "components": ["web-app"],
+  "reporter": "Priya",
+  "assignee": "",
+  "linked_issues": ["PROJ-130"],
+  "epic": "PROJ-100",
+  "comments": [
+    {"author": "Priya", "created": "2026-08-18", "body": "Mostly happens on mobile Safari from what support is hearing."},
+    {"author": "Dan", "created": "2026-08-19", "body": "I think PROJ-130 changed the session cookie to SameSite=Strict, could be related."},
+    {"author": "Priya", "created": "2026-08-20", "body": "Also if the fix is risky, a quick workaround for mobile is fine for this sprint, proper fix can be a follow-up."}
+  ]
+}

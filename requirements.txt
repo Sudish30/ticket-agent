@@ -1,0 +1,11 @@
+langgraph>=0.2
+langchain-anthropic>=0.3
+anthropic>=0.40
+pydantic>=2
+requests
+# Quorum web UI backend: python -m uvicorn quorum_backend.server:app --port 8000
+fastapi
+uvicorn
+# dev / demo: unit tests, and the Flask app in demo_repo/ used by `--repo demo_repo`
+pytest
+flask

@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.claude/settings.local.json
+brief.json
+brief.md
+quorum_backend/tickets.json

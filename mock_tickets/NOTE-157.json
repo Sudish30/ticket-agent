@@ -1,0 +1,10 @@
+{
+  "key": "NOTE-157",
+  "summary": "Password reset link never works",
+  "description": "Users click the reset link from the email and get 'token invalid or expired' every time. The email arrives fine.",
+  "issue_type": "Bug", "priority": "High", "labels": ["auth"], "components": ["notely"],
+  "reporter": "Priya", "assignee": "", "linked_issues": [], "epic": "",
+  "comments": [
+    {"author": "Priya", "created": "2026-08-21", "body": "One person said it worked when they clicked it literally instantly, so maybe it's a timing thing?"}
+  ]
+}

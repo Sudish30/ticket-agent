@@ -1,0 +1,12 @@
+{
+  "key": "NOTE-142",
+  "summary": "People keep getting logged out",
+  "description": "Getting a bunch of support tickets that users sign in and then are immediately bounced back to the login page. Started after the last release. Please look asap.",
+  "issue_type": "Bug", "priority": "High", "labels": ["auth"], "components": ["notely"],
+  "reporter": "Priya", "assignee": "", "linked_issues": ["PROJ-130"], "epic": "",
+  "comments": [
+    {"author": "Priya", "created": "2026-08-18", "body": "Support says it's mostly people on their phones."},
+    {"author": "Dan", "created": "2026-08-19", "body": "PROJ-130 tightened the session cookie last sprint, might be related, haven't checked."},
+    {"author": "Priya", "created": "2026-08-20", "body": "If a proper fix is risky, a quick workaround this sprint is fine."}
+  ]
+}
