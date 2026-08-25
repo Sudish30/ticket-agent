@@ -12,19 +12,19 @@ if it comes back neither answered nor deferred it becomes an assumption and is n
 from __future__ import annotations
 
 import json
-import os
 import re
 from typing import Callable
 
 from langchain_anthropic import ChatAnthropic
 from langgraph.graph import END, StateGraph
 
+from . import llm as _shared_llm
 from . import prompts
 from .channels import Channel
 from .codebase import Codebase, MAX_FILES
 from .schemas import AgentState, ClarificationTurn, Question, TaskBrief, Ticket
 
-MODEL = os.environ.get("TICKET_AGENT_MODEL", "claude-sonnet-4-6")
+MODEL = _shared_llm.MODEL  # re-exported; the definition lives in ticket_agent/llm.py, shared with solver_agent
 
 # Canonical answer texts for questions the agent decides on its own (answered_by="assumption").
 DEFERRED = "Deferred to agent's judgement"
@@ -33,27 +33,16 @@ NEVER_ASKED = "Not asked (no clarification rounds left) — agent will assume th
 
 
 def _llm() -> ChatAnthropic:
-    return ChatAnthropic(model=MODEL, temperature=0, max_tokens=4000)
+    return _shared_llm.make_llm()
 
 
 def _json(text: str) -> dict:
     """Tolerant JSON extraction: strips fences and grabs the outermost object."""
-    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M).strip()
-    start, end = text.find("{"), text.rfind("}")
-    return json.loads(text[start : end + 1])
+    return _shared_llm.extract_json(text)
 
 
 def _call(prompt: str, retries: int = 2) -> dict:
-    llm = _llm()
-    last = None
-    for _ in range(retries + 1):
-        out = llm.invoke([("system", prompts.SYSTEM), ("user", prompt)]).content
-        try:
-            return _json(out)
-        except (json.JSONDecodeError, ValueError) as e:
-            last = e
-            prompt = prompt + "\n\nYour previous output was not valid JSON. Output ONLY the JSON object."
-    raise RuntimeError(f"Model did not return valid JSON: {last}")
+    return _shared_llm.call_json(prompt, prompts.SYSTEM, retries=retries, llm_factory=_llm)
 
 
 def _transcript(state: AgentState) -> str:

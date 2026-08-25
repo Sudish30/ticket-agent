@@ -6,4 +6,6 @@ __pycache__/
 .claude/settings.local.json
 brief.json
 brief.md
+solution.json
+solution.md
 quorum_backend/tickets.json

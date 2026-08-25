@@ -33,6 +33,9 @@ python main.py PROJ-142 --jira --post-brief
 # Quorum web UI + backend (needs the Quorum checkout next to this repo, see below)
 python -m uvicorn quorum_backend.server:app --port 8000   # open http://localhost:8000
 
+# Stage 2: solve the brief (patches a temp copy of the repo, runs pytest)
+python -m solver_agent.main brief.json --repo demo_repo
+
 # Unit tests (LLM calls mocked, no API key needed)
 python -m unittest -v
 ```
@@ -59,6 +62,7 @@ constraints, out_of_scope, resolved_questions, assumptions, evidence, confidence
 | `jira_client.py` | Jira Cloud REST + ADF→text + mock loader |
 | `codebase.py` | `Codebase`: file tree + file reads for a local dir or GitHub repo (used by `--repo`) |
 | `demo_repo/` | Notely, a tiny Flask app with planted bugs that `mock_tickets/NOTE-*.json` describe |
+| `solver_agent/` | stage 2: plans + writes exact string edits per the `TaskBrief`, applies them to a temp copy, runs pytest, emits `Solution` (solution.json/.md) |
 
 ## Knobs
 - `--max-rounds` (default 3): human-facing rounds including sign-off, so at most `max-rounds - 1` clarification
@@ -107,6 +111,17 @@ export ANTHROPIC_API_KEY=...                                   # TICKET_AGENT_RE
 python -m uvicorn quorum_backend.server:app --port 8000
 open http://localhost:8000
 ```
+
+## Solver agent (stage 2)
+
+`python -m solver_agent.main brief.json --repo demo_repo` takes the confirmed brief, reads the suspected files (plus
+any files the brief's `affected_areas`/`evidence` prose names, plus their local imports), plans and writes exact
+`old_str → new_str` edits, applies them to a fresh temp copy of the repo, and runs pytest — up to 3 attempts, feeding
+failures back into the retry. Verification is judged against a baseline run and has three outcomes: **passed** (fixed a
+previously-failing test, or a newly-added regression test passes — always with zero new failures), **applied_unverified**
+(patch applies cleanly and breaks nothing, but no test verifies it — stated honestly in the rationale), and **failed**
+(new failures or patch errors after all retries). Bugs the brief leaves out of scope stay unfixed by design, and a patch
+whose only remaining failures are out-of-scope ones stops retrying immediately.
 
 Flow: **New ticket** → the intake agent starts automatically (status **Clarifying**) and posts grounded questions in the
 ticket's Clarification thread → reply as the reporter → the agent posts its sign-off → reply `confirm` → status

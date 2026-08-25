@@ -1,8 +1,9 @@
-# CLAUDE.md — Ticket Understanding Agent
+# CLAUDE.md — Ticket Agents (intake + solver)
 
-First agent in a multi-agent Jira pipeline. Reads a ticket (optionally grounded in a codebase), asks the
-reporter clarifying questions — each at most once — gets sign-off, and emits a structured `TaskBrief`
-(Pydantic) for downstream planner/coder/tester agents.
+Two stages of a multi-agent Jira pipeline. The **intake agent** (`ticket_agent/`) reads a ticket (optionally
+grounded in a codebase), asks the reporter clarifying questions — each at most once — gets sign-off, and emits a
+structured `TaskBrief` (Pydantic). The **solver agent** (`solver_agent/`) takes that brief, patches a temp copy of
+the repo with exact string edits, runs pytest, and emits a `Solution` for downstream reviewer/shipper agents.
 
 ## Commands
 
@@ -20,6 +21,7 @@ python main.py PROJ-142 --jira --post-brief           # ...and post brief.md's M
 python -m unittest -v                                 # unit tests (tests/, LLM calls mocked, no API key needed)
 python -m pytest demo_repo/tests                      # the demo app's own suite: 2 fail, 1 pass (planted bugs)
 python -m uvicorn quorum_backend.server:app --port 8000   # Quorum web UI + backend at http://localhost:8000 (UI from ../Quorum)
+python -m solver_agent.main brief.json --repo demo_repo   # stage 2: patch a temp copy per the brief → solution.json + solution.md
 ```
 
 `examples/` is not a package — it needs `PYTHONPATH=.` to import `ticket_agent`.
@@ -43,6 +45,7 @@ lookup_codebase ──► analyze ──► (nothing left to ask) ──► buil
 | file | role |
 |---|---|
 | `ticket_agent/graph.py` | LangGraph nodes, routing, `build_graph(channel)`, `run(ticket, channel, contact, max_rounds, repo) -> TaskBrief` |
+| `ticket_agent/llm.py` | shared LLM plumbing for both agents: `MODEL`, `make_llm()`, `extract_json()`, `call_json(prompt, system)` (graph modules keep patchable `_llm`/`_call` delegates) |
 | `ticket_agent/schemas.py` | `Ticket`/`Comment` (input), `Question`, `ClarificationTurn`, `TaskBrief` (output contract; `.to_markdown()` = brief.md / posted comment, `.as_comment()` = short plain text), `AgentState` |
 | `ticket_agent/prompts.py` | `SYSTEM` + 6 task prompts: `SELECT_FILES`, `ANALYZE`, `ASK_HUMAN`, `INGEST_ANSWER`, `BUILD_BRIEF`, `CONFIRM`; `ROUND_NOTE_FIRST` / `ROUND_NOTE_LATER` slot into `ASK_HUMAN` |
 | `ticket_agent/codebase.py` | `Codebase.open(spec)` — local dir or GitHub `owner/name[@ref]`; `files`, `tree_text()`, `read()`, `context_text(paths)`; `MAX_FILES=12`, `MAX_FILE_CHARS=6000` |
@@ -54,6 +57,11 @@ lookup_codebase ──► analyze ──► (nothing left to ask) ──► buil
 | `tests/test_rounds.py` | ask-once rule, sign-off round reservation, `build_brief` assumptions, `analyze` grounding, `lookup_codebase` |
 | `tests/test_markdown.py` | `TaskBrief.to_markdown()` section order, checklist, table escaping, collapsed Q&A, empty sections |
 | `tests/test_quorum_backend.py` | backend routes + `FakeJiraClient` via FastAPI `TestClient` (temp store, `requests` shimmed into the client); UI-serving test skips without `../Quorum` |
+| `solver_agent/graph.py` | solver nodes + routing; `run(brief, repo, max_attempts) -> Solution`; `apply_edits` / `PatchError` |
+| `solver_agent/schemas.py` | `Edit`, `Solution` (output contract; `.to_markdown()` = solution.md), `SolverState` |
+| `solver_agent/prompts.py` | solver `SYSTEM` + `PLAN_FIX`, `WRITE_PATCH`; `RETRY_NOTE` slots into `WRITE_PATCH` |
+| `solver_agent/main.py` | CLI `python -m solver_agent.main brief.json --repo demo_repo`; writes `solution.json` + `solution.md` |
+| `tests/test_solver.py` | stubbed-LLM solver runs on a tiny fixture repo with real pytest: first-try pass, retry with feedback, patch-error feedback, zero/multi-match errors, exhausted-but-honest, new-test-passes → passed, applied_unverified + short-circuit, affected_areas prose paths in context |
 | `mock_tickets/*.json` | `Ticket`-shaped fixtures: `PROJ-142` (standalone), `NOTE-142/151/157` (describe bugs planted in `demo_repo/`) |
 | `demo_repo/` | Notely, a tiny Flask app: NOTE-142 → `auth/session.py` SameSite=Strict; NOTE-151 → `forms/validators.py` email regex; NOTE-157 → `auth/tokens.py` TTL in minutes compared to seconds |
 | `INTEGRATION.md` | the 4 Jira REST routes a fake Jira / custom ticket UI must implement for `--jira` mode |
@@ -138,6 +146,43 @@ any other author's comment. On success: status `Brief ready`, `brief` (dict) + `
 the ticket and the markdown posted as a final comment; on exception: status `Agent error` with the message.
 Ticket keys are `QT-001`, `QT-002`, …
 
+### Solver Agent (`solver_agent/`)
+
+```
+load_brief ─► read_files ─► plan_fix ─► write_patch ─► apply_patch ─► run_tests ─► emit_solution ─► END
+                                            ▲                              │ (retry: new failures, patch errors,
+                                            └──────────────────────────────┘  or in-scope failures remain; max 3)
+```
+
+- **load_brief** — `TaskBrief.model_validate` on the input, fails loudly on malformed briefs; requires a *local*
+  repo directory (the solver copies it). Opens `Codebase` — imported from `ticket_agent.codebase`, not duplicated.
+- **read_files** — every existing `suspected_files` path, plus any repo file named in the brief's `affected_areas`
+  / `evidence` prose (`_prose_paths`, whole-path regex match — the solver reads what it may edit, never blind edits
+  from prose), plus the repo-local modules they import (breadth-first), capped at `MAX_CONTEXT_FILES = 15`; full
+  contents from disk (not `Codebase.read`, which truncates at 6000 chars). Also runs the **baseline pytest** once
+  on a pristine copy (`baseline_failed` + `baseline_counts`) so plan_fix can classify pre-existing failures.
+- **plan_fix** — one JSON call → `{diagnosis, changes: [{path, what, why}], risks, out_of_scope_failures}`; gets the
+  baseline failing test ids and must classify each as covered by the brief or not (`out_of_scope_failures` must stay
+  failing); must obey the brief's constraints / out_of_scope / related_findings and only plan files that serve the
+  acceptance criteria. Binding rule in the prompt: flipping an unrelated failing test never counts as success.
+- **write_patch** — one JSON call → `edits: [{path, old_str, new_str, reason}]`: exact unique string replacements,
+  never whole-file rewrites. On retry the prompt carries the previous edits, the failure output, and a
+  fix-wrong-vs-approach-wrong diagnosis instruction; each attempt returns the COMPLETE edit set (never stacked).
+- **apply_patch** — fresh temp copy of the repo per attempt (excluding `.git`/`__pycache__`/`.venv`/…); an edit whose
+  `old_str` matches zero or multiple times raises `PatchError`, recorded as a failed attempt and fed back, not a crash.
+- **run_tests** — `python -m pytest -q` in the temp copy, 120 s timeout. **Three outcomes** vs the baseline, all
+  requiring zero new failures for success: `passed` = fixed ≥ 1 baseline failure OR ≥ 1 newly-added test passes
+  (detected via total-count delta minus new failures — credit for self-written regression tests when the suite
+  doesn't cover the bug, e.g. NOTE-142); `applied_unverified` = nothing flipped green and no new test verifies it,
+  and every remaining failure is a baseline one the plan classified out of scope — **terminal**, so a settled patch
+  is never re-solved (no retry burn); `retry` = new failures, patch errors, or an in-scope baseline failure still
+  failing → back to write_patch (exhaustion → `failed`). Pre-existing out-of-scope failures stay failing by design
+  (demo_repo has 3 planted bugs; one brief covers one bug).
+- **emit_solution** — `Solution`: status `passed|applied_unverified|failed`, attempts, edits, unified diff (difflib,
+  temp dir vs repo), files_changed, test counts, last-30-line tail, rationale (diagnosis + fixed / verified-by-new-
+  tests / left-failing (split in-scope vs out-of-scope) / new-failure notes; `applied_unverified` must say the suite
+  cannot verify the fix; honest on give-up), duration_seconds. The final temp workdir is left on disk for inspection.
+
 ### Data conventions
 
 - `Ticket.as_text()` renders comments oldest-first and the prompts state that later comments
@@ -175,6 +220,10 @@ Ticket keys are `QT-001`, `QT-002`, …
   consumes one, and `input()` raises `EOFError` once stdin is exhausted.
 - `Codebase.open("owner/name")` hits the GitHub API (needs network; `GITHUB_TOKEN` avoids rate limits); a local
   path never does. `IGNORE_DIRS` / `CODE_EXT` in `codebase.py` decide what is listed.
+- Solver `status: "passed"` is **baseline-relative**, not suite-green: check `tests_failed` / `test_output_tail`
+  for the pre-existing failures it deliberately left alone. A correct patch for a bug with no covering test comes
+  back `applied_unverified` (not `failed`) unless the model adds a passing regression test — then it's `passed`.
+  The solver only accepts a local `--repo` directory and leaves its final patched copy in a `solver-<ticket>-…` temp dir.
 - The Quorum backend must run on **port 8000**: `_run_agent` hard-codes `FakeJiraClient(base_url="http://127.0.0.1:8000")`
   and the UI's `app.js` falls back to `http://localhost:8000` when served from any other port. Run it as a single
   process (the store is a JSON file guarded by an in-process lock).

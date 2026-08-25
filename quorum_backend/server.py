@@ -5,7 +5,8 @@
 
 Creating a ticket starts the intake agent immediately (status "Clarifying"); POST /solve is a manual retry.
 
-Env: ANTHROPIC_API_KEY (required), TICKET_AGENT_REPO (default: demo_repo), QUORUM_UI_DIR (default: ../Quorum)
+Env: ANTHROPIC_API_KEY (required), TICKET_AGENT_REPO (default: demo_repo), QUORUM_UI_DIR (default: the Quorum
+checkout — the repo root when this code lives in Quorum/agent/, else ../Quorum next to the ticket-agent repo)
 """
 from __future__ import annotations
 
@@ -25,8 +26,12 @@ from ticket_agent.jira_client import FakeJiraClient
 from ticket_agent.schemas import Ticket
 
 AGENT_NAME = os.environ.get("JIRA_AGENT_NAME", "Ticket Agent")
-REPO = os.environ.get("TICKET_AGENT_REPO", str(Path(__file__).resolve().parent.parent / "demo_repo"))
-UI_DIR = Path(os.environ.get("QUORUM_UI_DIR", Path(__file__).resolve().parent.parent.parent / "Quorum"))
+_HOME = Path(__file__).resolve().parents[1]          # folder holding quorum_backend/: Quorum/agent/ or ticket-agent/
+REPO = os.environ.get("TICKET_AGENT_REPO", str(_HOME / "demo_repo"))
+# Vendored inside the Quorum repo (Quorum/agent/quorum_backend/), the UI is the repo root one level up from agent/;
+# as a standalone checkout it is the sibling ../Quorum.
+_DEFAULT_UI = _HOME.parent if (_HOME.parent / "index.html").is_file() else _HOME.parent / "Quorum"
+UI_DIR = Path(os.environ.get("QUORUM_UI_DIR", _DEFAULT_UI))
 DB = Path(__file__).parent / "tickets.json"
 _lock = threading.RLock()
 
