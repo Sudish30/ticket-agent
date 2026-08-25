@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="application-name" content="Quorum" />
+    <meta name="apple-mobile-web-app-title" content="Quorum" />
+    <meta name="description" content="Quorum keeps incoming tickets and attempted solutions in one quiet decision workspace." />
+    <title>Quorum</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;700&amp;family=JetBrains+Mono:wght@400;600&amp;family=Space+Grotesk:wght@500;700&amp;display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="tokens.css" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to workspace</a>
+
+    <header class="topbar">
+      <div class="topbar__inner">
+        <a class="brand" href="#tickets" data-screen-link="tickets" aria-label="Quorum tickets">
+          <span class="brand__mark" aria-hidden="true">Q</span>
+          <span>Quorum</span>
+        </a>
+
+        <div class="topbar__tools">
+          <div class="role-toggle" role="group" aria-label="View as">
+            <span class="role-toggle__label">View as</span>
+            <button class="role-toggle__option" type="button" data-role="reporter" aria-pressed="true">Reporter</button>
+            <button class="role-toggle__option" type="button" data-role="engineer" aria-pressed="false">Engineer</button>
+          </div>
+          <button class="btn btn--primary" type="button" data-screen-link="submission">New ticket</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="workspace" id="main" tabindex="-1">
+      <div class="workspace-head">
+        <h1 id="screenTitle">Tickets</h1>
+        <p id="screenDescription">Incoming work appears here. Open a ticket to review every solution attempted for it.</p>
+      </div>
+
+      <nav class="workspace-tabs" aria-label="Workspace">
+        <button class="tab-link" type="button" data-screen-link="tickets">Tickets</button>
+        <button class="tab-link" type="button" data-screen-link="solutions">Solutions</button>
+        <button class="tab-link" type="button" data-screen-link="setup">Setup</button>
+      </nav>
+
+      <div class="screen-root" id="screenRoot" aria-live="off"></div>
+    </main>
+
+    <footer class="system-foot">
+      <strong>Quorum</strong>
+      <span>Tickets in, decisions out.</span>
+      <button class="foot-link" type="button" data-screen-link="setup">Repository setup</button>
+    </footer>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>

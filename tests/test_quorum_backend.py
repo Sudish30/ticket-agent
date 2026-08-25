@@ -140,7 +140,7 @@ class QuorumBackend(unittest.TestCase):
             server._run_orchestrator("QT-001")
         self.assertEqual(self.tc.get("/api/tickets/QT-001").json()["status"], "Needs human review")
 
-    @unittest.skipUnless(server.UI_DIR.is_dir(), "Quorum UI checkout not present next to this repo")
+    @unittest.skipUnless(server.UI_DIR.is_dir(), "no UI dir (bundled ui/ missing and QUORUM_UI_DIR unset)")
     def test_serves_the_quorum_ui(self):
         r = self.tc.get("/")
         self.assertEqual(r.status_code, 200)

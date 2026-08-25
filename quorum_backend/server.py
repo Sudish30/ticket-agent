@@ -8,8 +8,9 @@ Once a brief is confirmed ("Brief ready"), POST /solve-brief runs the orchestrat
 background thread: status "Solving" → "PR ready" (package complete) or "Needs human review" (anything else),
 with pr_package + pr_package_md stored on the ticket and the PR markdown posted as a comment.
 
-Env: ANTHROPIC_API_KEY (required), TICKET_AGENT_REPO (default: demo_repo), QUORUM_UI_DIR (default: the Quorum
-checkout — the repo root when this code lives in Quorum/agent/, else ../Quorum next to the ticket-agent repo)
+Env: ANTHROPIC_API_KEY (required), TICKET_AGENT_REPO (default: demo_repo), QUORUM_UI_DIR (default: the bundled
+ui/ folder — or the Quorum repo root when this code lives in Quorum/agent/; point it at a live Quorum checkout
+when editing the UI)
 """
 from __future__ import annotations
 
@@ -33,8 +34,8 @@ AGENT_NAME = os.environ.get("JIRA_AGENT_NAME", "Ticket Agent")
 _HOME = Path(__file__).resolve().parents[1]          # folder holding quorum_backend/: Quorum/agent/ or ticket-agent/
 REPO = os.environ.get("TICKET_AGENT_REPO", str(_HOME / "demo_repo"))
 # Vendored inside the Quorum repo (Quorum/agent/quorum_backend/), the UI is the repo root one level up from agent/;
-# as a standalone checkout it is the sibling ../Quorum.
-_DEFAULT_UI = _HOME.parent if (_HOME.parent / "index.html").is_file() else _HOME.parent / "Quorum"
+# standalone, it is the wired copy bundled at ui/ — so a fresh clone serves the full web app with zero extra setup.
+_DEFAULT_UI = _HOME.parent if (_HOME.parent / "index.html").is_file() else _HOME / "ui"
 UI_DIR = Path(os.environ.get("QUORUM_UI_DIR", _DEFAULT_UI))
 DB = Path(__file__).parent / "tickets.json"
 _lock = threading.RLock()

@@ -106,11 +106,12 @@ follow-ups — they never become acceptance criteria or questions unless the rep
 ## Quorum web UI
 
 `quorum_backend/server.py` is a small FastAPI app that stores tickets in `quorum_backend/tickets.json`, runs the agent
-on demand, and serves the [Quorum](https://github.com/S-kalakota/Quorum) UI (branch `wire-intake-agent`, with the
-backend-wired `app.js`).
+on demand, and serves the [Quorum](https://github.com/S-kalakota/Quorum) UI. The backend-wired UI files
+(`index.html`, `app.js`, `styles.css`, `tokens.css`, from branch `wire-intake-agent`) are bundled in `ui/`, so a
+fresh clone serves the full web app with no extra setup; set `QUORUM_UI_DIR=/path/to/Quorum` to serve a live
+checkout instead while editing the UI.
 
 ```bash
-git clone https://github.com/S-kalakota/Quorum ../Quorum      # or set QUORUM_UI_DIR=/path/to/Quorum
 export ANTHROPIC_API_KEY=...                                   # TICKET_AGENT_REPO defaults to demo_repo
 python -m uvicorn quorum_backend.server:app --port 8000
 open http://localhost:8000

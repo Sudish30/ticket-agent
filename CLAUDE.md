@@ -23,7 +23,7 @@ python main.py PROJ-142 --jira --terminal             # real ticket, answer in t
 python main.py PROJ-142 --jira --post-brief           # ...and post brief.md's Markdown as a final comment
 python -m unittest -v                                 # unit tests (tests/, LLM calls mocked, no API key needed)
 python -m pytest demo_repo/tests                      # the demo app's own suite: 2 fail, 1 pass (planted bugs)
-python -m uvicorn quorum_backend.server:app --port 8000   # Quorum web UI + backend at http://localhost:8000 (UI from ../Quorum)
+python -m uvicorn quorum_backend.server:app --port 8000   # Quorum web UI + backend at http://localhost:8000 (UI bundled in ui/)
 python -m solver_agent.main brief.json --repo demo_repo   # stage 2: patch a temp copy per the brief → solution.json + solution.md
 python -m orchestrator.main brief.json --repo demo_repo   # stage 3: plan → workers → evaluate → pr_package.json + pr_package.md
 ```
@@ -34,7 +34,7 @@ and use `ScriptedChannel` (records `.sent`, feeds canned replies) as the human-i
 
 Env vars: `ANTHROPIC_API_KEY` (required), `TICKET_AGENT_MODEL` (default `claude-sonnet-4-6`),
 `TICKET_AGENT_REPO` (default for `--repo`; the Quorum backend defaults it to `demo_repo`), `GITHUB_TOKEN` (optional,
-for `owner/name[@branch]` repos), `QUORUM_UI_DIR` (Quorum checkout to serve; default `../Quorum`),
+for `owner/name[@branch]` repos), `QUORUM_UI_DIR` (UI dir to serve; default: the bundled `ui/`),
 `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` / `JIRA_AGENT_NAME` (only for `--jira`).
 
 ## Architecture
@@ -148,8 +148,8 @@ so swapping the human-in-the-loop transport never touches the graph.
 
 `python -m uvicorn quorum_backend.server:app --port 8000` from the repo root. Routes: `GET/POST /api/tickets`,
 `GET /api/tickets/{key}`, `POST …/comments {author, body}`, `POST …/status/{status}`, `POST …/solve`; `/` and
-static files come from `QUORUM_UI_DIR` (default `../Quorum`, the `wire-intake-agent` checkout whose `app.js` is
-wired to these routes and polls every 3 s; its topbar **View as** toggle — Reporter / Engineer, `localStorage`
+static files come from `QUORUM_UI_DIR` (default: the bundled `ui/` copy of the `wire-intake-agent` UI; point it at
+a live Quorum checkout when editing the UI) whose `app.js` is wired to these routes and polls every 3 s; its topbar **View as** toggle — Reporter / Engineer, `localStorage`
 `quorum-role` — hides solving controls, the brief and the Solutions tab from reporters, and the reply box from
 engineers). `POST /api/tickets` saves the ticket with status `Clarifying` and immediately starts `_run_agent` in a
 daemon thread (`_start_agent`); `POST …/solve` is only a manual retry, accepted when status is `Agent error` (or legacy
@@ -305,6 +305,9 @@ load_brief ─► plan_subtasks ─► dispatch ─► evaluate ─► (all reso
 - The Quorum backend must run on **port 8000**: `_run_agent` hard-codes `FakeJiraClient(base_url="http://127.0.0.1:8000")`
   and the UI's `app.js` falls back to `http://localhost:8000` when served from any other port. Run it as a single
   process (the store is a JSON file guarded by an in-process lock).
+- The served UI defaults to the bundled `ui/` folder — edits to a `../Quorum` checkout do NOT show up unless you
+  run with `QUORUM_UI_DIR=../Quorum` or re-copy the four files (`index.html`, `app.js`, `styles.css`, `tokens.css`)
+  into `ui/`.
 
 ## Planned (from README, not implemented)
 
