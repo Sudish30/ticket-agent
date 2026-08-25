@@ -11,6 +11,12 @@ code_writer "passed" → accept; "applied_unverified" → accept WITHOUT retryin
 exists (appended if the plan lacks one) to write the regression test for exactly that fix, and once it lands,
 re-check the suite in the workspace to mark the chain verified; "failed" → retry with LLM feedback (max 2),
 then one replan, then an honest permanent failure. Other workers are judged by the LLM evaluator.
+
+After assembly, the REVIEW GATE always runs (assemble_pr → review_gate): an independent reviewer judges the
+brief + diff + changed files + tests (never the workers' rationales). Blockers trigger ONE repair round (a
+scoped code_writer/test_writer subtask back through dispatch, then reassemble + re-review once); a still-
+blocked review finalizes as status "needs_human_review" with the change requests attached. Minors-only
+normalizes to approve with follow-ups. Never loops forever, never silently approves.
 """
 from __future__ import annotations
 
@@ -24,13 +30,15 @@ from pathlib import Path
 from langgraph.graph import END, StateGraph
 from pydantic import ValidationError
 
-from solver_agent.graph import _copy_repo, _pytest
+from solver_agent.graph import _baseline, _copy_repo, _pytest
 from ticket_agent.llm import call_json, make_llm
 from ticket_agent.schemas import TaskBrief
 
 from . import prompts, registry
+from .workers import reviewer as _reviewer        # noqa: F401  (importing registers the worker)
 from .workers import test_writer as _test_writer  # noqa: F401  (importing registers the worker)
-from .schemas import OrchestratorState, PRPackage, Subtask, SubtaskReport
+from .schemas import (ChangeRequest, OrchestratorState, PRPackage, Review, ReviewCheck,
+                      Subtask, SubtaskReport)
 
 MAX_RETRIES = 2          # per subtask, after its first attempt
 MAX_REPLANS = 1
@@ -70,6 +78,8 @@ def _validate_subtasks(raw, existing_ids=()) -> list[Subtask]:
         if not isinstance(s, dict):
             continue
         worker = str(s.get("worker", ""))
+        if worker == "reviewer":
+            continue                             # the review gate always runs after assembly — never planned
         if worker not in registry.WORKERS:
             raise ValueError(f"plan uses unknown worker {worker!r}; the registry has {sorted(registry.WORKERS)}")
         sid = str(s.get("id") or f"s{i + 1}")
@@ -158,7 +168,10 @@ def _deny(state: OrchestratorState, st: Subtask, feedback: str, updates: dict) -
         fb[st.id] = feedback or "the previous attempt was rejected; try a different approach within the brief's scope"
         st.status = "pending"                                  # re-dispatched with the feedback in its ctx
         updates["feedback"] = fb
-    elif state.get("replans", 0) < state.get("max_replans", MAX_REPLANS):
+    elif (not st.id.startswith("repair-")
+          and state.get("replans", 0) < state.get("max_replans", MAX_REPLANS)):
+        # Repair subtasks never consume the plan-level replan: the repair round is the review's own retry,
+        # and its exhaustion goes back to the reviewer (round 2 → needs_human_review), not into a new plan.
         updates["replan_requested"] = True                     # subtask stays unresolved; replan() records it
     else:
         st.status = "failed"
@@ -210,7 +223,8 @@ def evaluate(state: OrchestratorState) -> OrchestratorState:
         if verdict == "accept":
             st.status = "accepted"
             st.summary = res.get("summary") or str(data.get("reason", ""))[:300]
-        elif verdict == "replan" and state.get("replans", 0) < state.get("max_replans", MAX_REPLANS):
+        elif (verdict == "replan" and not st.id.startswith("repair-")
+              and state.get("replans", 0) < state.get("max_replans", MAX_REPLANS)):
             updates["replan_requested"] = True
         else:
             _deny(state, st, str(data.get("feedback", "")), updates)
@@ -267,6 +281,9 @@ def _tree(root: str) -> dict[str, str]:
 
 
 def assemble_pr(state: OrchestratorState) -> OrchestratorState:
+    repo_baseline = state.get("repo_baseline")
+    if repo_baseline is None:                    # once: which tests already failed on the UNTOUCHED repo
+        repo_baseline, _ = _baseline(state["repo"])
     a, b = _tree(state["repo"]), _tree(state["workspace"])
     changed = sorted(p for p in set(a) | set(b) if a.get(p) != b.get(p))
     diff = ""
@@ -314,7 +331,80 @@ def assemble_pr(state: OrchestratorState) -> OrchestratorState:
         pr_description=description,
         duration_seconds=round(time.time() - state.get("started", time.time()), 1),
     )
-    return {"pr": pr}
+    return {"pr": pr, "repo_baseline": repo_baseline}
+
+
+# ---------------- Review gate ----------------
+
+def _blockers(review: dict) -> list[dict]:
+    return [c for c in (review.get("change_requests") or [])
+            if isinstance(c, dict) and str(c.get("severity")) == "blocker"]
+
+
+def review_gate(state: OrchestratorState) -> OrchestratorState:
+    """Mandatory final step: independent review of the assembled PR. Sees the brief, diff, tests and the full
+    changed files — never the workers' rationales. A crashed review NEVER silently approves."""
+    pr: PRPackage = state["pr"]
+    ws = state["workspace"]
+    files = {}
+    for p in pr.files_changed:
+        f = Path(ws, p)
+        if f.is_file():
+            files[p] = f.read_text(errors="replace")
+    ctx = {"brief": state["brief"], "repo": state["repo"], "workspace": ws,
+           "diff": pr.combined_diff, "files": files, "tests_passed": pr.tests_passed,
+           "tests_failed": pr.tests_failed, "new_tests": list(pr.new_tests_added),
+           "baseline_failed": list(state.get("repo_baseline") or [])}   # facts, not worker rationale
+    updates: OrchestratorState = {"review_rounds": state.get("review_rounds", 0) + 1}
+    try:
+        res = registry.WORKERS["reviewer"](ctx)
+    except Exception as e:
+        res = {"verdict": "request_changes",
+               "checks": [{"name": "review", "result": "warn", "note": f"reviewer crashed: {e}"}],
+               "change_requests": [{"file": "", "issue": f"the review could not run: {e}",
+                                    "suggestion": "review this PR manually", "severity": "blocker"}]}
+        updates["repair_done"] = True            # repairing code cannot fix a crashed reviewer
+    return {**updates, "review": res}
+
+
+def repair(state: OrchestratorState) -> OrchestratorState:
+    """Turn the review's blockers into ONE scoped subtask and hand it back to the dispatch machinery."""
+    blockers = _blockers(state["review"])
+    worker = ("test_writer" if blockers and
+              all(str(b.get("file", "")).startswith("tests/") for b in blockers) else "code_writer")
+    lines = "\n".join(f"- {b.get('file') or '(unspecified file)'}: {b.get('issue', '')}"
+                      f" — suggestion: {b.get('suggestion', '')}" for b in blockers)
+    st = Subtask(id=f"repair-{state.get('review_rounds', 1)}", worker=worker,
+                 instruction=("The reviewer blocked this PR. Fix EXACTLY these issues and nothing else:\n"
+                              f"{lines}\nDo not change anything the reviewer did not flag."),
+                 rationale="mandatory review gate: blocking change requests must be fixed before merge")
+    subtasks = state["subtasks"]
+    subtasks.append(st)
+    plan_json = list(state.get("plan_json") or []) + [{**_plan_dump(st), "appended_by": "reviewer (repair round)"}]
+    return {"subtasks": subtasks, "plan_json": plan_json, "repair_done": True}
+
+
+def finalize(state: OrchestratorState) -> OrchestratorState:
+    pr: PRPackage = state["pr"]
+    raw = state.get("review") or {}
+    checks = [ReviewCheck(name=str(c.get("name", "")),
+                          result=str(c.get("result")) if str(c.get("result")) in ("pass", "fail", "warn") else "warn",
+                          note=str(c.get("note", "")))
+              for c in (raw.get("checks") or []) if isinstance(c, dict)]
+    crs = [ChangeRequest(file=str(c.get("file", "")), issue=str(c.get("issue", "")),
+                         suggestion=str(c.get("suggestion", "")),
+                         severity="blocker" if str(c.get("severity")) == "blocker" else "minor")
+           for c in (raw.get("change_requests") or []) if isinstance(c, dict)]
+    if not checks and not crs:                   # an empty review is not an approval
+        crs = [ChangeRequest(issue="the reviewer returned no checks and no change requests",
+                             suggestion="review this PR manually", severity="blocker")]
+    blockers = [c for c in crs if c.severity == "blocker"]
+    review = Review(verdict="request_changes" if blockers else "approve",
+                    checks=checks, change_requests=crs, rounds=state.get("review_rounds", 1))
+    status = pr.status
+    if blockers and status != "failed":          # a blocked review outranks complete/partial — never silently approve
+        status = "needs_human_review"
+    return {"pr": pr.model_copy(update={"review": review, "status": status})}
 
 
 # ---------------- Routing / build ----------------
@@ -331,10 +421,17 @@ def after_evaluate(state: OrchestratorState) -> str:
     return "assemble_pr"
 
 
+def after_review(state: OrchestratorState) -> str:
+    if _blockers(state.get("review") or {}) and not state.get("repair_done"):
+        return "repair"                          # one repair round; a second blocked review goes to finalize
+    return "finalize"
+
+
 def build_graph():
     g = StateGraph(OrchestratorState)
     for name, fn in [("load_brief", load_brief), ("plan_subtasks", plan_subtasks), ("dispatch", dispatch),
-                     ("evaluate", evaluate), ("replan", replan), ("assemble_pr", assemble_pr)]:
+                     ("evaluate", evaluate), ("replan", replan), ("assemble_pr", assemble_pr),
+                     ("review_gate", review_gate), ("repair", repair), ("finalize", finalize)]:
         g.add_node(name, fn)
     g.set_entry_point("load_brief")
     g.add_edge("load_brief", "plan_subtasks")
@@ -343,7 +440,10 @@ def build_graph():
     g.add_conditional_edges("evaluate", after_evaluate,
                             {"dispatch": "dispatch", "replan": "replan", "assemble_pr": "assemble_pr"})
     g.add_edge("replan", "dispatch")
-    g.add_edge("assemble_pr", END)
+    g.add_edge("assemble_pr", "review_gate")
+    g.add_conditional_edges("review_gate", after_review, {"repair": "repair", "finalize": "finalize"})
+    g.add_edge("repair", "dispatch")
+    g.add_edge("finalize", END)
     return g.compile()
 
 

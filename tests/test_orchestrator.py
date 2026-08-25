@@ -34,6 +34,18 @@ REPLAN_RESP = {"subtasks": [
 EVAL_ACCEPT = {"verdict": "accept", "feedback": "", "reason": "meets the instruction"}
 EVAL_RETRY = {"verdict": "retry_with_feedback", "feedback": "use X", "reason": "wrong approach"}
 PR_STUB = {"pr_title": "QT-9: make add() add", "pr_description": "**What** ... **Why** ... **How tested** ... **Risks** ..."}
+CHECK_NAMES = ["acceptance_criteria", "constraints", "out_of_scope", "regressions_security", "tests_assert_acs"]
+APPROVE_REVIEW = {"verdict": "approve",
+                  "checks": [{"name": n, "result": "pass", "note": "ok"} for n in CHECK_NAMES],
+                  "change_requests": []}
+BLOCK_REVIEW = {"verdict": "request_changes",
+                "checks": [{"name": "acceptance_criteria", "result": "fail", "note": "AC1 unmet"}],
+                "change_requests": [{"file": "calc.py", "issue": "add() still subtracts for negatives",
+                                     "suggestion": "handle negative operands", "severity": "blocker"}]}
+MINOR_REVIEW = {"verdict": "request_changes",
+                "checks": [{"name": "regressions_security", "result": "warn", "note": "style only"}],
+                "change_requests": [{"file": "calc.py", "issue": "missing docstring",
+                                     "suggestion": "add one", "severity": "minor"}]}
 
 
 def scripted_worker(*results):
@@ -62,6 +74,7 @@ class OrchestratorBase(unittest.TestCase):
         self.tmp.cleanup()
 
     def _run(self, workers, llm_replies):
+        workers = {"reviewer": scripted_worker(APPROVE_REVIEW), **workers}   # the gate runs on every path
         with patch.dict(registry.WORKERS, workers), \
              patch("orchestrator.graph._call", side_effect=list(llm_replies)) as call:
             pr = run(BRIEF, str(self.repo))
@@ -163,6 +176,85 @@ class Routing(OrchestratorBase):
         self.assertIn("# QT-9: make add() add", md)
         self.assertIn("```diff", md)
         self.assertIn("| s1 | code_writer | accepted | 1 |", md)
+
+
+class ReviewGate(OrchestratorBase):
+    @staticmethod
+    def _fixing_cw(ctx):                                       # actually patches the shared workspace
+        p = Path(ctx["workspace"], "calc.py")
+        p.write_text(p.read_text().replace("a - b", "a + b"))
+        return {"status": "passed", "summary": "fixed add()"}
+
+    def test_approve_path(self):
+        rv = scripted_worker(APPROVE_REVIEW)
+        pr, call = self._run({"code_writer": self._fixing_cw, "reviewer": rv}, [PLAN_CODE_ONLY, PR_STUB])
+        self.assertEqual((pr.status, pr.review.verdict, pr.review.rounds), ("complete", "approve", 1))
+        self.assertEqual(len(rv.calls), 1)
+        ctx = rv.calls[0]
+        self.assertNotIn("all_results", ctx)                   # independent judgment: no worker rationales
+        self.assertNotIn("upstream", ctx)
+        self.assertIn("calc.py", ctx["files"])                 # full changed-file content, not just the diff
+        self.assertIn("return a + b", ctx["files"]["calc.py"])
+        self.assertIn("-    return a - b", ctx["diff"])
+        self.assertEqual(ctx["baseline_failed"], ["tests/test_calc.py::test_add"])   # pre-existing facts provided
+        md = pr.to_markdown()
+        self.assertIn("## Review", md)
+        self.assertIn("acceptance_criteria", md)
+
+    def test_blocker_repair_then_approve(self):
+        cw = scripted_worker({"status": "passed", "summary": "fixed"})
+        rv = scripted_worker(BLOCK_REVIEW, APPROVE_REVIEW)
+        pr, call = self._run({"code_writer": cw, "reviewer": rv}, [PLAN_CODE_ONLY, PR_STUB, PR_STUB])
+        self.assertEqual((pr.status, pr.review.verdict, pr.review.rounds), ("complete", "approve", 2))
+        self.assertEqual(len(rv.calls), 2)
+        self.assertEqual(len(cw.calls), 2)                     # the original subtask + the repair subtask
+        self.assertIn("add() still subtracts for negatives", cw.calls[1]["instruction"])
+        self.assertIn("nothing else", cw.calls[1]["instruction"])
+        by_id = {s.id: s for s in pr.subtasks}
+        self.assertEqual(by_id["repair-1"].status, "accepted")
+
+    def test_blocker_repair_still_blocked_needs_human_review(self):
+        cw = scripted_worker({"status": "passed", "summary": "fixed"})
+        rv = scripted_worker(BLOCK_REVIEW)                     # blocks every round
+        pr, call = self._run({"code_writer": cw, "reviewer": rv}, [PLAN_CODE_ONLY, PR_STUB, PR_STUB])
+        self.assertEqual(pr.status, "needs_human_review")
+        self.assertEqual((pr.review.verdict, pr.review.rounds), ("request_changes", 2))
+        self.assertEqual(len(rv.calls), 2)                     # exactly one repair round — never loops
+        self.assertEqual(pr.review.change_requests[0].severity, "blocker")
+        md = pr.to_markdown()
+        self.assertIn("🛑", md)
+        self.assertIn("Change requests (blocking)", md)
+
+    def test_minors_only_is_approve_with_followups(self):
+        cw = scripted_worker({"status": "passed", "summary": "fixed"})
+        rv = scripted_worker(MINOR_REVIEW)
+        pr, call = self._run({"code_writer": cw, "reviewer": rv}, [PLAN_CODE_ONLY, PR_STUB])
+        self.assertEqual((pr.status, pr.review.verdict), ("complete", "approve"))   # normalized from minors-only
+        self.assertEqual(len(rv.calls), 1)                     # no repair round for minors
+        self.assertEqual(pr.review.change_requests[0].severity, "minor")
+        self.assertIn("Follow-ups (minor)", pr.to_markdown())
+
+    def test_repair_failure_does_not_consume_replan(self):
+        cw = scripted_worker({"status": "passed", "summary": "fixed"},      # s1 passes...
+                             {"status": "failed", "summary": "cannot"})     # ...the repair attempts all fail
+        rv = scripted_worker(BLOCK_REVIEW)                     # blocks both rounds
+        pr, call = self._run({"code_writer": cw, "reviewer": rv},
+                             [PLAN_CODE_ONLY, PR_STUB, EVAL_RETRY, EVAL_RETRY, PR_STUB])
+        self.assertEqual(call.call_count, 5)                   # plan + 2 PRs + 2 retry-feedbacks — NO replan call
+        self.assertEqual(pr.status, "needs_human_review")
+        by_id = {s.id: s for s in pr.subtasks}
+        self.assertEqual(by_id["repair-1"].status, "failed")
+        self.assertIn("exhausted", by_id["repair-1"].summary)
+        self.assertEqual(len(rv.calls), 2)                     # still exactly one re-review
+
+    def test_planned_reviewer_subtasks_are_dropped(self):
+        plan = {"subtasks": [
+            {"id": "s0", "worker": "reviewer", "instruction": "review it", "depends_on": [], "rationale": "?"},
+            {"id": "s1", "worker": "code_writer", "instruction": "fix add()", "depends_on": [], "rationale": "AC1"}]}
+        cw = scripted_worker({"status": "passed", "summary": "fixed"})
+        pr, call = self._run({"code_writer": cw}, [plan, PR_STUB])
+        self.assertEqual([s.worker for s in pr.subtasks], ["code_writer"])   # the gate is never a planned subtask
+        self.assertEqual(pr.status, "complete")
 
 
 if __name__ == "__main__":

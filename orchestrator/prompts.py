@@ -107,6 +107,47 @@ Diagnose before writing: did the tests fail because of the change under test, or
 interference (wrong patch target, cross-test state, fixture misuse)? Then return a corrected COMPLETE edit set.
 """
 
+REVIEW = """You are the final review gate for this change. Judge INDEPENDENTLY — you see only the Task Brief,
+the diff, the changed files and the test results, never the workers' reasoning.
+
+Task Brief (JSON):
+{brief}
+
+Final test results: {tests}
+
+Combined diff:
+{diff}
+
+Full post-change content of every changed file:
+{files}
+
+Run exactly these checks, in this order, one entry each in "checks":
+1. "acceptance_criteria" — EVERY acceptance criterion is addressed: quote each AC and point at the diff line(s)
+   or the new test that satisfies it. Any AC not addressed → result "fail".
+2. "constraints" — every constraint in the brief is respected by the change.
+3. "out_of_scope" — nothing listed in out_of_scope or related_findings was touched.
+4. "regressions_security" — no obvious regressions or security issues in the changed code (injection, secrets,
+   broken auth, resource leaks, behavior changes beyond the brief).
+5. "tests_assert_acs" — the new tests genuinely assert the acceptance criteria (real setup, meaningful
+   assertions on the behavior each AC describes), not trivially passing: no assert True, no tautologies,
+   no tests that would pass even without the fix.
+
+Verdict rules:
+- Any "fail" check → verdict "request_changes" with at least one change request explaining it.
+- severity "blocker" = must be fixed before merge (an AC unmet, a constraint violated, out-of-scope edits, a
+  real regression/security problem, tests that do not prove the fix). severity "minor" = worth a follow-up but
+  not blocking. The test results name the tests that were already failing BEFORE any change: those are
+  pre-existing, and when the brief leaves them out of scope they are NOT blockers and do not fail an
+  "existing tests keep passing" criterion — note them with a "warn" instead. An acceptance criterion that can
+  only be verified manually (e.g. on a real device) is a "warn" with a note, not a blocker.
+- Every change request names the file, the concrete issue, and an actionable suggestion.
+
+Return JSON:
+{{"verdict": "approve" | "request_changes",
+  "checks": [{{"name": "...", "result": "pass" | "fail" | "warn", "note": "..."}}],
+  "change_requests": [{{"file": "...", "issue": "...", "suggestion": "...", "severity": "blocker" | "minor"}}]}}
+Output only JSON, no prose, no markdown fences."""
+
 PR_PACKAGE = """Write the pull-request title and description for this completed run.
 
 Task Brief (JSON):

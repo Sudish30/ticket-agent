@@ -30,10 +30,15 @@ out_md.write_text(pr.to_markdown())
 
 print("\nPlan:")
 print(json.dumps(final.get("plan_json", []), indent=2))
-icon = {"complete": "✅", "partial": "🟡"}.get(pr.status, "❌")
+icon = {"complete": "✅", "partial": "🟡", "needs_human_review": "🛑"}.get(pr.status, "❌")
 print(f"\n{icon} {pr.ticket_id}: {pr.status} — {pr.tests_passed} passed, {pr.tests_failed} failed, "
       f"{len(pr.new_tests_added)} new test(s) ({pr.duration_seconds:.0f}s)")
 for s in pr.subtasks:
     print(f"  [{s.status}] {s.id} · {s.worker} · {s.attempts} attempt(s): {s.summary[:110]}")
+if pr.review:
+    b = sum(1 for c in pr.review.change_requests if c.severity == "blocker")
+    m = len(pr.review.change_requests) - b
+    print(f"Review: {pr.review.verdict} — {len(pr.review.checks)} check(s), {b} blocker(s), "
+          f"{m} minor(s), {pr.review.rounds} round(s)")
 print(f"Workspace (left on disk): {final['workspace']}")
 print(f"PR package written to {out_json} and {out_md}")

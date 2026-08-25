@@ -135,9 +135,14 @@ temp workspace — `code_writer` (the solver agent, scoped by the subtask instru
 pytest tests for the acceptance criteria against the patched code). Results are evaluated status-aware: a `passed`
 fix is accepted, an `applied_unverified` fix is never retried but gets a regression-test subtask appended to verify
 it, and a `failed` one is retried with feedback (max 2), then replanned (max 1), then reported honestly. The run
-ends with `pr_package.json`/`pr_package.md`: subtask outcomes, combined diff, test counts, new tests, and an
-LLM-written PR title + description. Adding a worker (e.g. `docs_writer`) is one `@register`-decorated function in
-`orchestrator/registry.py`.
+run always ends at the **review gate**: an independent reviewer judges the brief + diff + full changed files +
+tests (never the workers' reasoning) against five checks — every acceptance criterion addressed, constraints
+respected, out_of_scope untouched, no regressions/security issues, and new tests genuinely asserting the ACs.
+Blocking change requests get ONE repair round (a scoped subtask, then one re-review); a still-blocked run ships as
+`needs_human_review` with the change requests attached, and minors-only approves with follow-ups. The result is
+`pr_package.json`/`pr_package.md`: subtask outcomes, the review table, combined diff, test counts, new tests, and
+an LLM-written PR title + description. Adding a worker (e.g. `docs_writer`) is one `@register`-decorated function
+in `orchestrator/registry.py`.
 
 Flow: **New ticket** → the intake agent starts automatically (status **Clarifying**) and posts grounded questions in the
 ticket's Clarification thread → reply as the reporter → the agent posts its sign-off → reply `confirm` → status

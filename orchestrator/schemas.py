@@ -32,15 +32,39 @@ class SubtaskReport(BaseModel):
     summary: str
 
 
-class PRPackage(BaseModel):
-    """Output contract with the downstream reviewer/shipper: everything needed to open the PR.
+class ReviewCheck(BaseModel):
+    name: str
+    result: Literal["pass", "fail", "warn"] = "warn"
+    note: str = ""
 
-    status: "complete" — every subtask accepted; "partial" — some accepted, some failed/skipped
-    (honest per-subtask statuses); "failed" — nothing was accepted.
+
+class ChangeRequest(BaseModel):
+    file: str = ""
+    issue: str = ""
+    suggestion: str = ""
+    severity: Literal["blocker", "minor"] = "minor"
+
+
+class Review(BaseModel):
+    """The mandatory final review gate's output. verdict is normalized from the blockers
+    (minors-only → approve with follow-ups); rounds counts review passes (2 after a repair round)."""
+
+    verdict: Literal["approve", "request_changes"]
+    checks: list[ReviewCheck] = []
+    change_requests: list[ChangeRequest] = []
+    rounds: int = 1
+
+
+class PRPackage(BaseModel):
+    """Output contract with the downstream shipper: everything needed to open the PR.
+
+    status: "complete" — every subtask accepted and the review approved; "partial" — some accepted, some
+    failed/skipped (honest per-subtask statuses); "failed" — nothing was accepted;
+    "needs_human_review" — the review gate still has blocking change requests after the one repair round.
     """
 
     ticket_id: str
-    status: Literal["complete", "partial", "failed"]
+    status: Literal["complete", "partial", "failed", "needs_human_review"]
     subtasks: list[SubtaskReport] = []
     combined_diff: str = ""
     files_changed: list[str] = []
@@ -49,11 +73,13 @@ class PRPackage(BaseModel):
     new_tests_added: list[str] = []
     pr_title: str = ""
     pr_description: str = ""
+    review: Optional[Review] = None
     duration_seconds: float = 0.0
 
     def to_markdown(self) -> str:
         """The PR package as Markdown: written to pr_package.md next to pr_package.json."""
-        icon = {"complete": "✅", "partial": "🟡", "failed": "❌"}.get(self.status, "❌")
+        icon = {"complete": "✅", "partial": "🟡", "failed": "❌",
+                "needs_human_review": "🛑"}.get(self.status, "❌")
         out = [
             f"# {self.pr_title or self.ticket_id}",
             "",
@@ -61,6 +87,25 @@ class PRPackage(BaseModel):
             f"{len(self.new_tests_added)} new test(s) · {self.duration_seconds:.0f}s_",
             "",
             self.pr_description or "_No description._",
+        ]
+        if self.review:
+            ricon = {"approve": "✅", "request_changes": "🛑"}.get(self.review.verdict, "🛑")
+            out += ["", "## Review", f"_{ricon} {self.review.verdict} · {self.review.rounds} round(s)_", ""]
+            if self.review.checks:
+                out += ["| check | result | note |", "|---|---|---|"]
+                ci = {"pass": "✅", "fail": "❌", "warn": "⚠️"}
+                for c in self.review.checks:
+                    note = c.note.replace("|", " ").replace(chr(10), " ")[:300]
+                    out.append(f"| {c.name} | {ci.get(c.result, '')} {c.result} | {note} |")
+            blockers = [c for c in self.review.change_requests if c.severity == "blocker"]
+            minors = [c for c in self.review.change_requests if c.severity == "minor"]
+            if blockers:
+                out += ["", "### Change requests (blocking)",
+                        *[f"- `{c.file or '—'}`: {c.issue} — _{c.suggestion}_" for c in blockers]]
+            if minors:
+                out += ["", "### Follow-ups (minor)",
+                        *[f"- `{c.file or '—'}`: {c.issue} — _{c.suggestion}_" for c in minors]]
+        out += [
             "",
             "## Subtasks",
             "| id | worker | status | attempts | summary |",
@@ -91,5 +136,9 @@ class OrchestratorState(TypedDict, total=False):
     max_replans: int             # whole-plan replans (default 1)
     replan_requested: bool
     pending_verification: list   # code subtask ids accepted as applied_unverified, awaiting a passing regression test
+    repo_baseline: list          # tests already failing on the untouched repo (computed once in assemble_pr)
+    review: dict                 # raw reviewer output of the latest review round (normalized in finalize)
+    review_rounds: int           # review passes run (1, or 2 after the repair round)
+    repair_done: bool            # the single repair round has been spent (or is pointless — reviewer crashed)
     started: float
     pr: Optional[PRPackage]

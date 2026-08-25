@@ -69,10 +69,11 @@ lookup_codebase ──► analyze ──► (nothing left to ask) ──► buil
 | `orchestrator/graph.py` | tech-lead nodes + routing; `run(brief, repo, max_retries, max_replans) -> PRPackage`; shared-workspace creation, status-aware `evaluate`, `replan`, `assemble_pr` |
 | `orchestrator/registry.py` | `WORKERS` dict + `@register(name, description)` decorator (adding docs_writer = one function); `code_writer` (wraps `solver_agent.graph.run` with `task_instruction`/`workspace`) |
 | `orchestrator/workers/test_writer.py` | small LangGraph worker: LLM writes pytest edits (modify with exact old_str, or create with old_str "") under `tests/` only, applies them in the workspace, pre/post pytest, restores everything it touched on failure |
+| `orchestrator/workers/reviewer.py` | the mandatory final review gate (registered, but invoked by `review_gate`, never planned): one `REVIEW` LLM call over brief + diff + full changed-file contents + tests — never the workers' rationales; returns verdict/checks/change_requests, blockers authoritative |
 | `orchestrator/schemas.py` | `Subtask` (internal, mutated in place), `SubtaskReport`, `PRPackage` (output contract; `.to_markdown()` = pr_package.md), `OrchestratorState` |
 | `orchestrator/prompts.py` | orchestrator `SYSTEM` + `PLAN_SUBTASKS`, `EVALUATE` (+`POLICY_FAILED`), `REPLAN`, `WRITE_TESTS`, `PR_PACKAGE`; `FEEDBACK_NOTE` slots into `WRITE_TESTS` |
 | `orchestrator/main.py` | CLI `python -m orchestrator.main brief.json --repo demo_repo`; prints the plan JSON + per-subtask outcomes; writes `pr_package.json` + `pr_package.md` |
-| `tests/test_orchestrator.py` | stubbed graph-LLM + registry-patched fake workers on the fixture repo: dependency ordering, the three status routes, retry-with-feedback, retry-exhausted → one replan → partial, PR assembly with real diff/pytest |
+| `tests/test_orchestrator.py` | stubbed graph-LLM + registry-patched fake workers on the fixture repo: dependency ordering, the three status routes, retry-with-feedback, retry-exhausted → one replan → partial, PR assembly with real diff/pytest, review gate (approve / blocker→repair→approve / still-blocked→needs_human_review / minors-only / planned-reviewer dropped) |
 | `mock_tickets/*.json` | `Ticket`-shaped fixtures: `PROJ-142` (standalone), `NOTE-142/151/157` (describe bugs planted in `demo_repo/`) |
 | `demo_repo/` | Notely, a tiny Flask app: NOTE-142 → `auth/session.py` SameSite=Strict; NOTE-151 → `forms/validators.py` email regex; NOTE-157 → `auth/tokens.py` TTL in minutes compared to seconds |
 | `INTEGRATION.md` | the 4 Jira REST routes a fake Jira / custom ticket UI must implement for `--jira` mode |
@@ -204,9 +205,10 @@ shared workspace. Standalone (no workspace) behavior is unchanged.
 ### Orchestrator (`orchestrator/`)
 
 ```
-load_brief ─► plan_subtasks ─► dispatch ─► evaluate ─► (all subtasks resolved) ─► assemble_pr ─► END
-                    ▲             ▲ │          │
-                    │ (replan ≤1) └─┴──────────┘ (retry ≤2 per subtask / next runnable subtask)
+load_brief ─► plan_subtasks ─► dispatch ─► evaluate ─► (all resolved) ─► assemble_pr ─► review_gate ─► finalize ─► END
+                    ▲             ▲ │          │                                             │
+                    │ (replan ≤1) └─┴──────────┘ (retry ≤2 per subtask)                      │ (blockers, repair
+                    └────────────────────────── repair ◄─────────────────────────────────────┘  round unspent: ≤1)
 ```
 
 - **Shared workspace** — `load_brief` copies the repo once into `orch-<ticket>-…/repo`; every worker patches it in
@@ -233,7 +235,18 @@ load_brief ─► plan_subtasks ─► dispatch ─► evaluate ─► (all subt
 - **assemble_pr** — combined diff = full-tree compare repo vs workspace (created/deleted files included), final
   pytest counts, `new_tests_added` from accepted test_writers, status `complete` (all accepted) / `partial`
   (some) / `failed` (none), and one `PR_PACKAGE` LLM call for `pr_title` + `pr_description`
-  (what/why/how-tested/risks; falls back to a deterministic title if the call fails). `recursion_limit=100`.
+  (what/why/how-tested/risks; falls back to a deterministic title if the call fails). Not terminal — the review
+  gate always follows. `recursion_limit=100`.
+- **review_gate → repair → finalize** — the mandatory final gate. `review_gate` invokes `WORKERS["reviewer"]`
+  with brief + combined diff + full post-change contents of every changed file + test results (NOT the workers'
+  rationales — independent judgment); the `REVIEW` prompt demands 5 named checks (acceptance_criteria — quote
+  each AC and point at the diff line, constraints, out_of_scope, regressions_security, tests_assert_acs).
+  Blockers are authoritative over the raw verdict. Blockers + repair round unspent → `repair` turns them into
+  ONE scoped subtask (`repair-<n>`; test_writer iff every blocker file is under `tests/`, else code_writer) and
+  hands it back to dispatch; then reassemble + re-review once. `finalize` normalizes the review onto the
+  PRPackage: still-blocked → status `needs_human_review` (outranks complete/partial, never `failed`);
+  minors-only → `approve` with the minors as follow-ups. A crashed or empty review is a blocker with the repair
+  skipped — never a silent approve. Planned "reviewer" subtasks are dropped in `_validate_subtasks`.
 
 ### Data conventions
 
@@ -276,9 +289,11 @@ load_brief ─► plan_subtasks ─► dispatch ─► evaluate ─► (all subt
   for the pre-existing failures it deliberately left alone. A correct patch for a bug with no covering test comes
   back `applied_unverified` (not `failed`) unless the model adds a passing regression test — then it's `passed`.
   The solver only accepts a local `--repo` directory and leaves its final patched copy in a `solver-<ticket>-…` temp dir.
-- Orchestrator `status: "complete"` means every subtask was accepted — NOT that the suite is green: out-of-scope
-  planted failures still fail in the final counts. The shared workspace (`orch-<ticket>-…/repo`) is left on disk;
-  the CLI prints its path. `code_writer` "passed" is accepted without any LLM evaluation call by design.
+- Orchestrator `status: "complete"` means every subtask was accepted AND the review approved — NOT that the suite
+  is green: out-of-scope planted failures still fail in the final counts. `needs_human_review` means the review
+  gate still had blockers after its one repair round (check `PRPackage.review.change_requests`). The shared
+  workspace (`orch-<ticket>-…/repo`) is left on disk; the CLI prints its path. `code_writer` "passed" is accepted
+  without any LLM evaluation call by design, and the reviewer runs even on a `failed` run (which keeps `failed`).
 - The Quorum backend must run on **port 8000**: `_run_agent` hard-codes `FakeJiraClient(base_url="http://127.0.0.1:8000")`
   and the UI's `app.js` falls back to `http://localhost:8000` when served from any other port. Run it as a single
   process (the store is a JSON file guarded by an in-process lock).
