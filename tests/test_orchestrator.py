@@ -3,6 +3,7 @@ replaced through the registry (patch.dict on WORKERS), so worker outputs are ful
 workspace, dependency ordering, retry/replan policy and PR assembly (with a real pytest run) are exercised
 for real on the calc fixture repo.
 """
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,8 @@ from unittest.mock import patch
 
 from orchestrator import registry
 from orchestrator.graph import run
+from orchestrator.workers.docs_writer import comment_only_change, docs_writer
+from ticket_agent.schemas import TaskBrief
 
 BRIEF = {
     "ticket_id": "QT-9", "ticket_type": "bug",
@@ -161,6 +164,26 @@ class Routing(OrchestratorBase):
         self.assertIn("exhausted", by_id["r1"].summary)
         self.assertEqual((by_id["r2"].status, pr.status), ("accepted", "partial"))
 
+    def test_evaluator_rejection_restores_workspace(self):
+        calls, saw_changelog = [], []
+
+        def appender(ctx):                                     # internally successful on EVERY attempt
+            calls.append(ctx)
+            cl = Path(ctx["workspace"], "CHANGELOG.md")
+            saw_changelog.append(cl.is_file())
+            cl.write_text((cl.read_text() if cl.is_file() else "# Changelog\n") + "## QT-9\n- entry\n")
+            return {"status": "passed", "summary": "wrote changelog", "files_changed": ["CHANGELOG.md"]}
+
+        plan = {"subtasks": [{"id": "s1", "worker": "test_writer", "instruction": "write the changelog",
+                              "depends_on": [], "rationale": "AC"}]}
+        pr, call = self._run({"test_writer": appender}, [plan, EVAL_RETRY, EVAL_ACCEPT, PR_STUB])
+        self.assertEqual(pr.status, "complete")
+        self.assertEqual(len(calls), 2)                        # rejected by the evaluator once, then retried
+        self.assertEqual(saw_changelog, [False, False])        # the retry saw the PRE-DISPATCH workspace
+        ws = Path(calls[0]["workspace"])
+        self.assertEqual((ws / "CHANGELOG.md").read_text().count("## QT-9"), 1)   # no duplicate artifacts
+        self.assertIn("CHANGELOG.md", pr.files_changed)        # the accepted attempt's work is kept
+
     def test_pr_assembly_diff_and_tests(self):
         def fixing_cw(ctx):                                    # actually patches the shared workspace
             p = Path(ctx["workspace"], "calc.py")
@@ -197,6 +220,7 @@ class ReviewGate(OrchestratorBase):
         self.assertIn("return a + b", ctx["files"]["calc.py"])
         self.assertIn("-    return a - b", ctx["diff"])
         self.assertEqual(ctx["baseline_failed"], ["tests/test_calc.py::test_add"])   # pre-existing facts provided
+        self.assertEqual(ctx["failing_tests"], [])             # ...and the exact currently-failing ids (none: fixed)
         md = pr.to_markdown()
         self.assertIn("## Review", md)
         self.assertIn("acceptance_criteria", md)
@@ -231,6 +255,7 @@ class ReviewGate(OrchestratorBase):
         pr, call = self._run({"code_writer": cw, "reviewer": rv}, [PLAN_CODE_ONLY, PR_STUB])
         self.assertEqual((pr.status, pr.review.verdict), ("complete", "approve"))   # normalized from minors-only
         self.assertEqual(len(rv.calls), 1)                     # no repair round for minors
+        self.assertEqual(rv.calls[0]["failing_tests"], ["tests/test_calc.py::test_add"])   # exact failing ids
         self.assertEqual(pr.review.change_requests[0].severity, "minor")
         self.assertIn("Follow-ups (minor)", pr.to_markdown())
 
@@ -255,6 +280,93 @@ class ReviewGate(OrchestratorBase):
         pr, call = self._run({"code_writer": cw}, [plan, PR_STUB])
         self.assertEqual([s.worker for s in pr.subtasks], ["code_writer"])   # the gate is never a planned subtask
         self.assertEqual(pr.status, "complete")
+
+
+class DocsGuard(unittest.TestCase):
+    def test_rejects_code_change(self):
+        self.assertFalse(comment_only_change("    return a - b", "    return a + b"))
+
+    def test_rejects_string_value_change(self):
+        self.assertFalse(comment_only_change('mode = "Strict"', 'mode = "Lax"'))
+
+    def test_rejects_code_change_hidden_behind_same_comment(self):
+        self.assertFalse(comment_only_change("x = 1  # note", "x = 2  # note"))
+
+    def test_accepts_comment_addition(self):
+        self.assertTrue(comment_only_change("x = 1", "x = 1  # tuned in QT-9"))
+
+    def test_accepts_comment_text_change(self):
+        self.assertTrue(comment_only_change('x = "Lax"  # hardened in PROJ-130',
+                                            'x = "Lax"  # Lax since NOTE-142: allows OAuth callbacks'))
+
+    def test_accepts_docstring_change(self):
+        self.assertTrue(comment_only_change('"""Old text."""', '"""New, much better text."""'))
+
+    def test_accepts_added_full_comment_line(self):
+        self.assertTrue(comment_only_change("def f():\n    pass", "def f():\n    # explains why\n    pass"))
+
+    def test_accepts_adding_a_missing_docstring(self):
+        self.assertTrue(comment_only_change("def f():\n    return 1",
+                                            'def f():\n    """Explains f, added later."""\n    return 1'))
+
+    def test_accepts_adding_a_multiline_docstring(self):
+        self.assertTrue(comment_only_change(
+            "def f():\n    return 1",
+            'def f():\n    """Explains f.\n\n    In detail, over lines.\n    """\n    return 1'))
+
+    def test_rejects_code_smuggled_next_to_a_docstring(self):
+        self.assertFalse(comment_only_change("def f():\n    pass",
+                                             'def f():\n    """doc"""; x = 1\n    pass'))
+
+    def test_hash_inside_string_is_not_a_comment(self):
+        self.assertFalse(comment_only_change('x = "a#b"', 'x = "a#c"'))   # string value change, not a comment
+
+
+class DocsWorker(OrchestratorBase):
+    def _ctx(self):
+        ws = Path(self.tmp.name) / "ws"
+        shutil.copytree(self.repo, ws)
+        ctx = {"brief": TaskBrief.model_validate(BRIEF), "workspace": str(ws),
+               "instruction": "document the fix", "feedback": "", "review": None, "upstream": {},
+               "all_results": {"s1": {"diff": "--- a/calc.py\n+++ b/calc.py\n", "files_changed": ["calc.py"]}}}
+        return ctx, ws
+
+    def test_accepts_comment_edit_and_writes_changelog(self):
+        ctx, ws = self._ctx()
+        reply = {"edits": [{"path": "calc.py", "old_str": "def add(a, b):",
+                            "new_str": "# adds two numbers (fixed in QT-9)\ndef add(a, b):", "reason": "clarify"}],
+                 "changelog": "- QT-9: add() now adds instead of subtracting."}
+        with patch("orchestrator.workers.docs_writer._call", return_value=reply):
+            res = docs_writer(ctx)
+        self.assertEqual(res["status"], "passed")
+        self.assertIn("# adds two numbers", (ws / "calc.py").read_text())
+        changelog = (ws / "CHANGELOG.md").read_text()
+        self.assertIn("## QT-9", changelog)
+        self.assertIn("- QT-9: add() now adds instead of subtracting.", changelog)
+        self.assertEqual(res["files_changed"], ["CHANGELOG.md", "calc.py"])
+        self.assertIn("a/CHANGELOG.md", res["diff"])
+
+    def test_rejects_code_edit_and_restores(self):
+        ctx, ws = self._ctx()
+        reply = {"edits": [{"path": "calc.py", "old_str": "    return a - b",
+                            "new_str": "    return a + b", "reason": "sneaky fix disguised as docs"}],
+                 "changelog": "- fix"}
+        with patch("orchestrator.workers.docs_writer._call", return_value=reply):
+            res = docs_writer(ctx)
+        self.assertEqual(res["status"], "failed")
+        self.assertIn("executable code", res["summary"])
+        self.assertIn("return a - b", (ws / "calc.py").read_text())     # untouched
+        self.assertFalse((ws / "CHANGELOG.md").exists())                # nothing half-applied
+
+    def test_rejects_edits_outside_changed_files(self):
+        ctx, ws = self._ctx()
+        reply = {"edits": [{"path": "tests/test_calc.py", "old_str": "from calc import add",
+                            "new_str": "from calc import add  # note", "reason": "not a changed file"}],
+                 "changelog": ""}
+        with patch("orchestrator.workers.docs_writer._call", return_value=reply):
+            res = docs_writer(ctx)
+        self.assertEqual(res["status"], "failed")
+        self.assertIn("only touch files this run changed", res["summary"])
 
 
 if __name__ == "__main__":

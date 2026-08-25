@@ -3,6 +3,7 @@
 Every worker is a callable(ctx) -> result dict, where ctx is:
   {"brief": TaskBrief, "repo": str, "workspace": str, "instruction": str, "feedback": str,
    "previous_result": result | None (this subtask's own last attempt, on retries),
+   "review": dict | None (the latest review-gate output, present only after a review has run),
    "upstream": {dep_subtask_id: result}, "all_results": {subtask_id: result}}
 and the result dict carries at least {"status": "passed" | "applied_unverified" | "failed", "summary": str}
 plus worker-specific keys (diff, files_changed, tests_added, ...). Workers patch the SHARED workspace in

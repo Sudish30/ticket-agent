@@ -131,8 +131,9 @@ whose only remaining failures are out-of-scope ones stops retrying immediately.
 
 `python -m orchestrator.main brief.json --repo demo_repo` acts as the tech lead: an LLM plan turns the brief into
 subtasks (`{id, worker, instruction, depends_on, rationale}`), each dispatched to a registered worker in ONE shared
-temp workspace — `code_writer` (the solver agent, scoped by the subtask instruction) and `test_writer` (writes new
-pytest tests for the acceptance criteria against the patched code). Results are evaluated status-aware: a `passed`
+temp workspace — `code_writer` (the solver agent, scoped by the subtask instruction), `test_writer` (writes new
+pytest tests for the acceptance criteria against the patched code), and `docs_writer` (refreshes comments/docstrings
+the fix made stale and appends a CHANGELOG note — a guard rejects any edit touching executable code). Results are evaluated status-aware: a `passed`
 fix is accepted, an `applied_unverified` fix is never retried but gets a regression-test subtask appended to verify
 it, and a `failed` one is retried with feedback (max 2), then replanned (max 1), then reported honestly. The run
 run always ends at the **review gate**: an independent reviewer judges the brief + diff + full changed files +

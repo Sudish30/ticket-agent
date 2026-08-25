@@ -131,12 +131,14 @@ class OrchestratorState(TypedDict, total=False):
     results: dict                # subtask id -> the worker's latest output dict
     feedback: dict               # subtask id -> evaluator feedback for the next retry
     current_id: str              # subtask just dispatched ("" when nothing was runnable)
+    attempt_snapshot: str        # pre-dispatch workspace copy; evaluate restores it when the attempt is rejected
     replans: int
     max_retries: int             # retries per subtask after its first attempt (default 2)
     max_replans: int             # whole-plan replans (default 1)
     replan_requested: bool
     pending_verification: list   # code subtask ids accepted as applied_unverified, awaiting a passing regression test
     repo_baseline: list          # tests already failing on the untouched repo (computed once in assemble_pr)
+    failing_now: list            # tests failing in the workspace at the last assembly (exact ids, for the reviewer)
     review: dict                 # raw reviewer output of the latest review round (normalized in finalize)
     review_rounds: int           # review passes run (1, or 2 after the repair round)
     repair_done: bool            # the single repair round has been spent (or is pointless — reviewer crashed)

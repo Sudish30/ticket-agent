@@ -70,6 +70,7 @@ lookup_codebase ──► analyze ──► (nothing left to ask) ──► buil
 | `orchestrator/registry.py` | `WORKERS` dict + `@register(name, description)` decorator (adding docs_writer = one function); `code_writer` (wraps `solver_agent.graph.run` with `task_instruction`/`workspace`) |
 | `orchestrator/workers/test_writer.py` | small LangGraph worker: LLM writes pytest edits (modify with exact old_str, or create with old_str "") under `tests/` only, applies them in the workspace, pre/post pytest, restores everything it touched on failure |
 | `orchestrator/workers/reviewer.py` | the mandatory final review gate (registered, but invoked by `review_gate`, never planned): one `REVIEW` LLM call over brief + diff + full changed-file contents + tests — never the workers' rationales; returns verdict/checks/change_requests, blockers authoritative |
+| `orchestrator/workers/docs_writer.py` | comment/docstring/CHANGELOG documentation for files the run changed; `comment_only_change` guard (code skeletons: triple-quoted blocks collapsed, quote-aware `#`-stripping, blank lines dropped) rejects any edit touching executable code; appends the changelog under `## <ticket>`; restores on failure |
 | `orchestrator/schemas.py` | `Subtask` (internal, mutated in place), `SubtaskReport`, `PRPackage` (output contract; `.to_markdown()` = pr_package.md), `OrchestratorState` |
 | `orchestrator/prompts.py` | orchestrator `SYSTEM` + `PLAN_SUBTASKS`, `EVALUATE` (+`POLICY_FAILED`), `REPLAN`, `WRITE_TESTS`, `PR_PACKAGE`; `FEEDBACK_NOTE` slots into `WRITE_TESTS` |
 | `orchestrator/main.py` | CLI `python -m orchestrator.main brief.json --repo demo_repo`; prints the plan JSON + per-subtask outcomes; writes `pr_package.json` + `pr_package.md` |
@@ -222,7 +223,10 @@ load_brief ─► plan_subtasks ─► dispatch ─► evaluate ─► (all reso
   subtasks) is kept in `plan_json` for display.
 - **dispatch** — first pending subtask whose `depends_on` are all accepted (list order breaks ties); subtasks whose
   dependency failed/skipped become `skipped`; a pending-but-never-runnable set (cycle) becomes `failed`; a crashing
-  worker is a failed attempt, not a crashed run. Feedback from the evaluator rides in `ctx["feedback"]`.
+  worker is a failed attempt, not a crashed run. Feedback from the evaluator rides in `ctx["feedback"]`. Every
+  dispatch snapshots the workspace first; `evaluate` restores that snapshot whenever the attempt is rejected —
+  even an internally-successful, evaluator-rejected attempt — so rejected work never leaks into retries or later
+  subtasks (the accepted attempt's snapshot is simply discarded).
 - **evaluate** — status-aware core routing for `code_writer`: `passed` → accept (no LLM call);
   `applied_unverified` → accept WITHOUT retrying, append a `verify-<id>` test_writer subtask (if no pending
   test_writer exists) instructed to write the regression test for exactly that fix, and track it in

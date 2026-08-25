@@ -13,7 +13,10 @@ Available workers (the registry — use only these names):
 
 Rules:
 - Every subtask must be justified by the brief: its rationale must cite the acceptance criterion or constraint it serves.
-- Typical shape: one code-change subtask, then a test subtask (depends_on the code change) verifying the acceptance criteria.
+- Typical shape: one code-change subtask, then a test subtask (depends_on the code change) verifying the
+  acceptance criteria, then a final docs_writer subtask (depends_on the code change) refreshing comments or
+  docstrings the fix made stale and adding the changelog note — include it unless the change truly needs no
+  documentation.
 - instruction is the worker's marching orders — concrete and scoped (e.g. "only fix the token TTL comparison; do not write tests").
 - depends_on lists subtask ids that must be ACCEPTED before this one runs.
 - Do not invent work the brief does not ask for; out_of_scope and related_findings stay untouched.
@@ -56,6 +59,8 @@ Failed / unresolved subtasks and their history:
 
 Return the NEW subtasks for the remaining work only, with fresh unique ids (e.g. "r1"), same JSON shape as planning.
 depends_on may reference accepted ids or new ids. Use a different approach than the one that failed.
+NEVER reroute a task to a different worker to bypass another worker's safety guard (e.g. documentation stays
+with docs_writer — its comments-only guard exists on purpose); rework the instruction instead.
 Return JSON: {{"subtasks": [{{"id": "r1", "worker": "...", "instruction": "...", "depends_on": [], "rationale": "..."}}]}}
 Output only JSON, no prose, no markdown fences."""
 
@@ -138,14 +143,50 @@ Verdict rules:
   real regression/security problem, tests that do not prove the fix). severity "minor" = worth a follow-up but
   not blocking. The test results name the tests that were already failing BEFORE any change: those are
   pre-existing, and when the brief leaves them out of scope they are NOT blockers and do not fail an
-  "existing tests keep passing" criterion — note them with a "warn" instead. An acceptance criterion that can
-  only be verified manually (e.g. on a real device) is a "warn" with a note, not a blocker.
+  "existing tests keep passing" criterion — note them with a "warn" instead. Judge test failures ONLY from the
+  currently-FAILING id list: a test named in an acceptance criterion that is NOT in that list is passing —
+  never infer which test failed from the counts. An acceptance criterion that can
+  only be verified manually (e.g. on a real device) is a "warn" with a note, not a blocker. Comment/docstring
+  updates and a CHANGELOG.md note documenting the change are acceptable housekeeping — they do not violate
+  code-scoped constraints.
 - Every change request names the file, the concrete issue, and an actionable suggestion.
 
 Return JSON:
 {{"verdict": "approve" | "request_changes",
   "checks": [{{"name": "...", "result": "pass" | "fail" | "warn", "note": "..."}}],
   "change_requests": [{{"file": "...", "issue": "...", "suggestion": "...", "severity": "blocker" | "minor"}}]}}
+Output only JSON, no prose, no markdown fences."""
+
+WRITE_DOCS = """Document the change this run already made — comments, docstrings and a changelog note ONLY.
+
+Task Brief (JSON):
+{brief}
+
+Your subtask instruction:
+{instruction}
+
+Combined diff of the changes made so far:
+{diff}
+
+Review result:
+{review}
+
+Current content of every changed file (your edits are applied to these exact contents):
+{files}
+{feedback}
+Rules:
+- You may ONLY edit comments (# ...) and docstrings (triple-quoted) in the files listed above. A deterministic
+  guard rejects any edit whose code differs outside comments/docstrings — never touch executable code, string
+  values, or test logic.
+- Update comments the change made stale (e.g. a comment still describing the OLD behavior), add a brief
+  clarifying comment where the fix is subtle, refresh docstrings that now say the wrong thing. Do not comment
+  the obvious, and do not reformat lines you are not documenting.
+- old_str must be copied EXACTLY from the file (whitespace included) and occur exactly once in it.
+- changelog: 1-3 Markdown bullet lines describing the change (what changed and why, referencing the ticket);
+  it is appended to CHANGELOG.md under a "## <ticket-id>" heading for you.
+
+Return JSON: {{"edits": [{{"path": "...", "old_str": "...", "new_str": "...", "reason": "..."}}],
+  "changelog": "- ..."}}
 Output only JSON, no prose, no markdown fences."""
 
 PR_PACKAGE = """Write the pull-request title and description for this completed run.

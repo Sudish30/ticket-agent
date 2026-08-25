@@ -23,6 +23,7 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -35,6 +36,7 @@ from ticket_agent.llm import call_json, make_llm
 from ticket_agent.schemas import TaskBrief
 
 from . import prompts, registry
+from .workers import docs_writer as _docs_writer  # noqa: F401  (importing registers the worker)
 from .workers import reviewer as _reviewer        # noqa: F401  (importing registers the worker)
 from .workers import test_writer as _test_writer  # noqa: F401  (importing registers the worker)
 from .schemas import (ChangeRequest, OrchestratorState, PRPackage, Review, ReviewCheck,
@@ -132,10 +134,16 @@ def dispatch(state: OrchestratorState) -> OrchestratorState:
                 s.summary = "failed: unsatisfiable dependencies"
         return {"current_id": "", "subtasks": subtasks}
     st.attempts += 1
+    old_snap = state.get("attempt_snapshot")
+    if old_snap:                                 # defensive: evaluate normally consumed it
+        shutil.rmtree(os.path.dirname(old_snap), ignore_errors=True)
+    snap = os.path.join(tempfile.mkdtemp(prefix="orch-attempt-"), "repo")
+    _copy_repo(state["workspace"], snap)         # pre-dispatch snapshot: rejected attempts are rolled back to it
     results = state["results"]
     ctx = {"brief": state["brief"], "repo": state["repo"], "workspace": state["workspace"],
            "instruction": st.instruction, "feedback": (state.get("feedback") or {}).get(st.id, ""),
            "previous_result": results.get(st.id),             # this subtask's last attempt (None on the first)
+           "review": state.get("review"),                     # the latest review, when one exists (repair runs)
            "upstream": {d: results[d] for d in st.depends_on if d in results},
            "all_results": dict(results)}
     try:
@@ -143,7 +151,7 @@ def dispatch(state: OrchestratorState) -> OrchestratorState:
     except Exception as e:                       # a crashing worker is a failed attempt, not a crashed run
         res = {"status": "failed", "summary": f"worker crashed: {e}", "error": str(e)}
     results[st.id] = res
-    return {"current_id": st.id, "results": results, "subtasks": subtasks}
+    return {"current_id": st.id, "results": results, "subtasks": subtasks, "attempt_snapshot": snap}
 
 
 def _find(subtasks: list[Subtask], sid: str) -> Subtask:
@@ -239,6 +247,16 @@ def evaluate(state: OrchestratorState) -> OrchestratorState:
                 v = _find(subtasks, vid)
                 v.summary = v.summary.replace(VERIFY_SUFFIX, " — verified by new regression test(s) in the workspace")
             updates["pending_verification"] = []
+
+    # Attempt snapshot: an attempt that was not accepted — even one the worker itself considered successful —
+    # is rolled back, so rejected work never leaks into later subtasks or retries.
+    snap = state.get("attempt_snapshot")
+    if snap:
+        if st.status != "accepted":
+            shutil.rmtree(state["workspace"], ignore_errors=True)
+            _copy_repo(snap, state["workspace"])
+        shutil.rmtree(os.path.dirname(snap), ignore_errors=True)
+    updates["attempt_snapshot"] = ""
     return {**updates, "subtasks": subtasks}
 
 
@@ -291,7 +309,7 @@ def assemble_pr(state: OrchestratorState) -> OrchestratorState:
         diff += "".join(difflib.unified_diff((a.get(p) or "").splitlines(keepends=True),
                                              (b.get(p) or "").splitlines(keepends=True),
                                              fromfile=f"a/{p}", tofile=f"b/{p}"))
-    _, _, _, counts = _pytest(state["workspace"])
+    _, _, failing_now, counts = _pytest(state["workspace"])
     tests_passed = counts.get("passed", 0)
     tests_failed = counts.get("failed", 0) + counts.get("error", 0)
 
@@ -331,7 +349,7 @@ def assemble_pr(state: OrchestratorState) -> OrchestratorState:
         pr_description=description,
         duration_seconds=round(time.time() - state.get("started", time.time()), 1),
     )
-    return {"pr": pr, "repo_baseline": repo_baseline}
+    return {"pr": pr, "repo_baseline": repo_baseline, "failing_now": sorted(failing_now)}
 
 
 # ---------------- Review gate ----------------
@@ -354,7 +372,8 @@ def review_gate(state: OrchestratorState) -> OrchestratorState:
     ctx = {"brief": state["brief"], "repo": state["repo"], "workspace": ws,
            "diff": pr.combined_diff, "files": files, "tests_passed": pr.tests_passed,
            "tests_failed": pr.tests_failed, "new_tests": list(pr.new_tests_added),
-           "baseline_failed": list(state.get("repo_baseline") or [])}   # facts, not worker rationale
+           "failing_tests": list(state.get("failing_now") or []),       # facts, not worker rationale:
+           "baseline_failed": list(state.get("repo_baseline") or [])}   # which tests fail now vs before
     updates: OrchestratorState = {"review_rounds": state.get("review_rounds", 0) + 1}
     try:
         res = registry.WORKERS["reviewer"](ctx)

@@ -40,6 +40,7 @@ def reviewer(ctx: dict) -> dict:
         brief=ctx["brief"].model_dump_json(indent=2),
         tests=f"{ctx.get('tests_passed', 0)} passed, {ctx.get('tests_failed', 0)} failed · "
               f"new tests: {', '.join(ctx.get('new_tests') or []) or '(none)'} · "
+              f"currently FAILING (exact ids): {', '.join(ctx.get('failing_tests') or []) or '(none)'} · "
               f"already failing BEFORE any change (pre-existing): "
               f"{', '.join(ctx.get('baseline_failed') or []) or '(none)'}",
         diff=_clip(ctx.get("diff") or "(empty)", MAX_DIFF_CHARS),
