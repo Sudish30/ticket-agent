@@ -72,7 +72,11 @@ def load_brief(state: SolverState) -> SolverState:
     repo = state["repo"]
     if not os.path.isdir(repo):
         raise ValueError(f"repo must be a local directory (got {repo!r}): the solver copies it to apply patches")
-    return {"brief": brief, "codebase": Codebase.open(repo), "started": time.time()}
+    ws = state.get("workspace")
+    if ws and not os.path.isdir(ws):
+        raise ValueError(f"workspace must be an existing directory (got {ws!r})")
+    src = ws or repo         # orchestrator mode: read, patch, baseline and diff against the shared workspace
+    return {"brief": brief, "codebase": Codebase.open(src), "src": src, "started": time.time()}
 
 
 IMPORT_RE = re.compile(r"^\s*(?:from\s+([.\w]+)\s+import|import\s+([\w.]+))", re.M)
@@ -135,7 +139,7 @@ def read_files(state: SolverState) -> SolverState:
     """
     cb: Codebase = state["codebase"]
     known = set(cb.files)
-    repo = Path(state["repo"])
+    src = Path(state["src"])
 
     ordered: list[str] = []
     for f in state["brief"].suspected_files:
@@ -147,25 +151,27 @@ def read_files(state: SolverState) -> SolverState:
             ordered.append(p)
     if not ordered:
         raise ValueError(f"Nothing to read: no suspected_files (or files named in affected_areas/evidence) "
-                         f"exist in {state['repo']!r}")
+                         f"exist in {state['src']!r}")
 
     queue = list(ordered)
     while queue and len(ordered) < MAX_CONTEXT_FILES:
         current = queue.pop(0)
-        for dep in _import_paths(current, (repo / current).read_text(errors="replace"), known):
+        for dep in _import_paths(current, (src / current).read_text(errors="replace"), known):
             if dep not in ordered and len(ordered) < MAX_CONTEXT_FILES:
                 ordered.append(dep)
                 queue.append(dep)
 
-    baseline_failed, baseline_counts = _baseline(state["repo"])
-    return {"files": {p: (repo / p).read_text(errors="replace") for p in ordered},
+    baseline_failed, baseline_counts = _baseline(state["src"])
+    return {"files": {p: (src / p).read_text(errors="replace") for p in ordered},
             "baseline_failed": baseline_failed, "baseline_counts": baseline_counts}
 
 
 def plan_fix(state: SolverState) -> SolverState:
     baseline = state.get("baseline_failed") or []
+    ti = state.get("task_instruction") or ""
     data = _call(prompts.PLAN_FIX.format(
         brief=state["brief"].model_dump_json(indent=2),
+        instruction=prompts.TASK_INSTRUCTION_NOTE.format(instruction=ti) if ti else "",
         files=_files_block(state["files"]),
         baseline="\n".join(f"- {t}" for t in baseline) or "(none — the suite is green before any patch)",
     ))
@@ -223,6 +229,24 @@ def apply_edits(workdir: str, edits: list[Edit]) -> None:
 
 
 def apply_patch(state: SolverState) -> SolverState:
+    ws = state.get("workspace")
+    if ws:
+        # Orchestrator mode: patch the shared workspace in place. A snapshot of its pre-solver state is taken
+        # once; every attempt resets the workspace to that snapshot before applying its full edit set.
+        snap = state.get("snapshot")
+        extra: SolverState = {}
+        if not snap:
+            snap = os.path.join(tempfile.mkdtemp(prefix=f"solver-snap-{state['brief'].ticket_id}-"), "repo")
+            _copy_repo(ws, snap)
+            extra = {"snapshot": snap}
+        shutil.rmtree(ws, ignore_errors=True)
+        _copy_repo(snap, ws)
+        try:
+            apply_edits(ws, state["edits"])
+            return {"workdir": ws, "patch_error": "", **extra}
+        except PatchError as e:
+            return {"workdir": ws, "patch_error": str(e), **extra}
+
     old = state.get("workdir")
     if old:
         shutil.rmtree(os.path.dirname(old), ignore_errors=True)   # drop the previous attempt's copy
@@ -263,7 +287,7 @@ def run_tests(state: SolverState) -> SolverState:
     baseline_failed = state.get("baseline_failed")
     baseline_counts = state.get("baseline_counts") or {}
     if baseline_failed is None:                            # fallback — read_files normally computed it
-        baseline_failed, baseline_counts = _baseline(state["repo"])
+        baseline_failed, baseline_counts = _baseline(state["src"])
 
     history = list(state.get("history") or [])
     edits_dump = [e.model_dump() for e in state.get("edits", [])]
@@ -327,7 +351,10 @@ def emit_solution(state: SolverState) -> SolverState:
     status = outcome if outcome in ("passed", "applied_unverified") else "failed"
     edits = state.get("edits", [])
     files_changed = sorted({e.path for e in edits}) if applied else []
-    diff = _unified_diff(state["repo"], state["workdir"], files_changed) if applied and state.get("workdir") else ""
+    base = state.get("snapshot") or state["src"]              # workspace mode diffs against the pre-solver snapshot
+    diff = _unified_diff(base, state["workdir"], files_changed) if applied and state.get("workdir") else ""
+
+    ws, snap = state.get("workspace"), state.get("snapshot")
 
     oos = (state.get("plan") or {}).get("out_of_scope_failures") or []
     remaining = state.get("remaining_failures") or []
@@ -352,6 +379,12 @@ def emit_solution(state: SolverState) -> SolverState:
                     "this fix: no covered test flipped green and no newly-added test exercises it.")
     if status == "failed":
         bits.append(f"Gave up after {state.get('attempts', 0)} attempt(s); this output reports the failure honestly.")
+
+    if ws and snap:
+        if status == "failed":                                 # leave the shared workspace as the solver found it
+            shutil.rmtree(ws, ignore_errors=True)
+            _copy_repo(snap, ws)
+        shutil.rmtree(os.path.dirname(snap), ignore_errors=True)   # the snapshot is no longer needed
 
     solution = Solution(
         ticket_id=state["brief"].ticket_id,
@@ -397,9 +430,20 @@ def build_graph():
     return g.compile()
 
 
-def run(brief: dict | TaskBrief, repo: str, max_attempts: int = 3) -> Solution:
-    """brief: TaskBrief or its dict form. repo: local directory. The final patched copy stays on disk (workdir)."""
+def run(brief: dict | TaskBrief, repo: str, max_attempts: int = 3,
+        task_instruction: str = "", workspace: str | None = None) -> Solution:
+    """brief: TaskBrief or its dict form. repo: local directory.
+
+    task_instruction: optional orchestrator note appended to the plan prompt to scope this run
+    (e.g. "only fix the token TTL, do not write tests").
+    workspace: optional existing shared directory to patch IN PLACE (orchestrator mode): the solver snapshots
+    it once, resets it to the snapshot per attempt, leaves the final patch in it on success and restores it on
+    failure. Standalone (None) keeps the temp-copy behavior; the final patched copy stays on disk (workdir).
+    """
     raw = brief.model_dump() if isinstance(brief, TaskBrief) else brief
-    final = build_graph().invoke({"brief_raw": raw, "repo": repo, "max_attempts": max_attempts},
-                                 config={"recursion_limit": 50})
+    init: SolverState = {"brief_raw": raw, "repo": repo, "max_attempts": max_attempts,
+                         "task_instruction": task_instruction or ""}
+    if workspace:
+        init["workspace"] = workspace
+    final = build_graph().invoke(init, config={"recursion_limit": 50})
     return final["solution"]

@@ -36,6 +36,9 @@ python -m uvicorn quorum_backend.server:app --port 8000   # open http://localhos
 # Stage 2: solve the brief (patches a temp copy of the repo, runs pytest)
 python -m solver_agent.main brief.json --repo demo_repo
 
+# Stage 3: orchestrate the brief (plan → code_writer + test_writer in one shared workspace → PR package)
+python -m orchestrator.main brief.json --repo demo_repo
+
 # Unit tests (LLM calls mocked, no API key needed)
 python -m unittest -v
 ```
@@ -63,6 +66,7 @@ constraints, out_of_scope, resolved_questions, assumptions, evidence, confidence
 | `codebase.py` | `Codebase`: file tree + file reads for a local dir or GitHub repo (used by `--repo`) |
 | `demo_repo/` | Notely, a tiny Flask app with planted bugs that `mock_tickets/NOTE-*.json` describe |
 | `solver_agent/` | stage 2: plans + writes exact string edits per the `TaskBrief`, applies them to a temp copy, runs pytest, emits `Solution` (solution.json/.md) |
+| `orchestrator/` | stage 3: tech lead — plans subtasks, dispatches registered workers (code_writer/test_writer) into one shared workspace, evaluates status-aware, replans on failure, emits `PRPackage` (pr_package.json/.md) |
 
 ## Knobs
 - `--max-rounds` (default 3): human-facing rounds including sign-off, so at most `max-rounds - 1` clarification
@@ -122,6 +126,18 @@ previously-failing test, or a newly-added regression test passes — always with
 (patch applies cleanly and breaks nothing, but no test verifies it — stated honestly in the rationale), and **failed**
 (new failures or patch errors after all retries). Bugs the brief leaves out of scope stay unfixed by design, and a patch
 whose only remaining failures are out-of-scope ones stops retrying immediately.
+
+## Orchestrator (stage 3)
+
+`python -m orchestrator.main brief.json --repo demo_repo` acts as the tech lead: an LLM plan turns the brief into
+subtasks (`{id, worker, instruction, depends_on, rationale}`), each dispatched to a registered worker in ONE shared
+temp workspace — `code_writer` (the solver agent, scoped by the subtask instruction) and `test_writer` (writes new
+pytest tests for the acceptance criteria against the patched code). Results are evaluated status-aware: a `passed`
+fix is accepted, an `applied_unverified` fix is never retried but gets a regression-test subtask appended to verify
+it, and a `failed` one is retried with feedback (max 2), then replanned (max 1), then reported honestly. The run
+ends with `pr_package.json`/`pr_package.md`: subtask outcomes, combined diff, test counts, new tests, and an
+LLM-written PR title + description. Adding a worker (e.g. `docs_writer`) is one `@register`-decorated function in
+`orchestrator/registry.py`.
 
 Flow: **New ticket** → the intake agent starts automatically (status **Clarifying**) and posts grounded questions in the
 ticket's Clarification thread → reply as the reporter → the agent posts its sign-off → reply `confirm` → status

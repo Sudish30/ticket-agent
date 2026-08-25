@@ -1,9 +1,12 @@
-# CLAUDE.md — Ticket Agents (intake + solver)
+# CLAUDE.md — Ticket Agents (intake + solver + orchestrator)
 
-Two stages of a multi-agent Jira pipeline. The **intake agent** (`ticket_agent/`) reads a ticket (optionally
+Three stages of a multi-agent Jira pipeline. The **intake agent** (`ticket_agent/`) reads a ticket (optionally
 grounded in a codebase), asks the reporter clarifying questions — each at most once — gets sign-off, and emits a
 structured `TaskBrief` (Pydantic). The **solver agent** (`solver_agent/`) takes that brief, patches a temp copy of
-the repo with exact string edits, runs pytest, and emits a `Solution` for downstream reviewer/shipper agents.
+the repo with exact string edits, runs pytest, and emits a `Solution`. The **orchestrator** (`orchestrator/`) is
+the tech lead: it plans subtasks from the brief, dispatches them to registered workers (code_writer wraps the
+solver; test_writer writes pytest tests) in ONE shared workspace, evaluates results status-aware, replans on
+failure, and assembles a `PRPackage` for downstream reviewer/shipper agents.
 
 ## Commands
 
@@ -22,6 +25,7 @@ python -m unittest -v                                 # unit tests (tests/, LLM 
 python -m pytest demo_repo/tests                      # the demo app's own suite: 2 fail, 1 pass (planted bugs)
 python -m uvicorn quorum_backend.server:app --port 8000   # Quorum web UI + backend at http://localhost:8000 (UI from ../Quorum)
 python -m solver_agent.main brief.json --repo demo_repo   # stage 2: patch a temp copy per the brief → solution.json + solution.md
+python -m orchestrator.main brief.json --repo demo_repo   # stage 3: plan → workers → evaluate → pr_package.json + pr_package.md
 ```
 
 `examples/` is not a package — it needs `PYTHONPATH=.` to import `ticket_agent`.
@@ -61,7 +65,14 @@ lookup_codebase ──► analyze ──► (nothing left to ask) ──► buil
 | `solver_agent/schemas.py` | `Edit`, `Solution` (output contract; `.to_markdown()` = solution.md), `SolverState` |
 | `solver_agent/prompts.py` | solver `SYSTEM` + `PLAN_FIX`, `WRITE_PATCH`; `RETRY_NOTE` slots into `WRITE_PATCH` |
 | `solver_agent/main.py` | CLI `python -m solver_agent.main brief.json --repo demo_repo`; writes `solution.json` + `solution.md` |
-| `tests/test_solver.py` | stubbed-LLM solver runs on a tiny fixture repo with real pytest: first-try pass, retry with feedback, patch-error feedback, zero/multi-match errors, exhausted-but-honest, new-test-passes → passed, applied_unverified + short-circuit, affected_areas prose paths in context |
+| `tests/test_solver.py` | stubbed-LLM solver runs on a tiny fixture repo with real pytest: first-try pass, retry with feedback, patch-error feedback, zero/multi-match errors, exhausted-but-honest, new-test-passes → passed, applied_unverified + short-circuit, affected_areas prose paths in context, workspace mode (in-place patch + restore-on-failure), task_instruction |
+| `orchestrator/graph.py` | tech-lead nodes + routing; `run(brief, repo, max_retries, max_replans) -> PRPackage`; shared-workspace creation, status-aware `evaluate`, `replan`, `assemble_pr` |
+| `orchestrator/registry.py` | `WORKERS` dict + `@register(name, description)` decorator (adding docs_writer = one function); `code_writer` (wraps `solver_agent.graph.run` with `task_instruction`/`workspace`) |
+| `orchestrator/workers/test_writer.py` | small LangGraph worker: LLM writes pytest edits (modify with exact old_str, or create with old_str "") under `tests/` only, applies them in the workspace, pre/post pytest, restores everything it touched on failure |
+| `orchestrator/schemas.py` | `Subtask` (internal, mutated in place), `SubtaskReport`, `PRPackage` (output contract; `.to_markdown()` = pr_package.md), `OrchestratorState` |
+| `orchestrator/prompts.py` | orchestrator `SYSTEM` + `PLAN_SUBTASKS`, `EVALUATE` (+`POLICY_FAILED`), `REPLAN`, `WRITE_TESTS`, `PR_PACKAGE`; `FEEDBACK_NOTE` slots into `WRITE_TESTS` |
+| `orchestrator/main.py` | CLI `python -m orchestrator.main brief.json --repo demo_repo`; prints the plan JSON + per-subtask outcomes; writes `pr_package.json` + `pr_package.md` |
+| `tests/test_orchestrator.py` | stubbed graph-LLM + registry-patched fake workers on the fixture repo: dependency ordering, the three status routes, retry-with-feedback, retry-exhausted → one replan → partial, PR assembly with real diff/pytest |
 | `mock_tickets/*.json` | `Ticket`-shaped fixtures: `PROJ-142` (standalone), `NOTE-142/151/157` (describe bugs planted in `demo_repo/`) |
 | `demo_repo/` | Notely, a tiny Flask app: NOTE-142 → `auth/session.py` SameSite=Strict; NOTE-151 → `forms/validators.py` email regex; NOTE-157 → `auth/tokens.py` TTL in minutes compared to seconds |
 | `INTEGRATION.md` | the 4 Jira REST routes a fake Jira / custom ticket UI must implement for `--jira` mode |
@@ -183,6 +194,47 @@ load_brief ─► read_files ─► plan_fix ─► write_patch ─► apply_pat
   tests / left-failing (split in-scope vs out-of-scope) / new-failure notes; `applied_unverified` must say the suite
   cannot verify the fix; honest on give-up), duration_seconds. The final temp workdir is left on disk for inspection.
 
+**Orchestrator mode:** `run(brief, repo, max_attempts=3, task_instruction="", workspace=None)`. `task_instruction`
+is appended to the plan prompt (`TASK_INSTRUCTION_NOTE`) so the orchestrator can scope a run ("only fix the token
+TTL, do not write tests"). With `workspace`, the solver reads/baselines/diffs against that shared directory
+(`state["src"]`) and patches it IN PLACE: a snapshot is taken once, every attempt resets the workspace to it,
+success leaves the patch in the workspace, and `status: failed` restores it — a failed solver never poisons the
+shared workspace. Standalone (no workspace) behavior is unchanged.
+
+### Orchestrator (`orchestrator/`)
+
+```
+load_brief ─► plan_subtasks ─► dispatch ─► evaluate ─► (all subtasks resolved) ─► assemble_pr ─► END
+                    ▲             ▲ │          │
+                    │ (replan ≤1) └─┴──────────┘ (retry ≤2 per subtask / next runnable subtask)
+```
+
+- **Shared workspace** — `load_brief` copies the repo once into `orch-<ticket>-…/repo`; every worker patches it in
+  place and every pytest (workers' + the final re-check) runs in it; it is left on disk. Workers must restore it
+  when they fail (both built-ins do).
+- **Registry** (`registry.py`) — `WORKERS: dict[name, callable(ctx) -> result]` + `DESCRIPTIONS` via
+  `@register(name, description)`; ctx = `{brief, repo, workspace, instruction, feedback, upstream, all_results}`;
+  result carries at least `{status, summary}`. `plan_subtasks` sees the registry as prompt text.
+- **plan_subtasks** — LLM → `[{id, worker, instruction, depends_on, rationale}]`; every subtask justified from the
+  brief; unknown workers fail loudly; duplicate ids are suffixed. The as-planned list (plus any orchestrator-appended
+  subtasks) is kept in `plan_json` for display.
+- **dispatch** — first pending subtask whose `depends_on` are all accepted (list order breaks ties); subtasks whose
+  dependency failed/skipped become `skipped`; a pending-but-never-runnable set (cycle) becomes `failed`; a crashing
+  worker is a failed attempt, not a crashed run. Feedback from the evaluator rides in `ctx["feedback"]`.
+- **evaluate** — status-aware core routing for `code_writer`: `passed` → accept (no LLM call);
+  `applied_unverified` → accept WITHOUT retrying, append a `verify-<id>` test_writer subtask (if no pending
+  test_writer exists) instructed to write the regression test for exactly that fix, and track it in
+  `pending_verification`; `failed` → LLM writes feedback → retry (≤ `max_retries`=2) → one replan
+  (`max_replans`=1) → honest permanent failure. Other workers (test_writer) are judged by the `EVALUATE` LLM
+  (accept | retry_with_feedback | replan, same caps). After an accepted test_writer, the suite is re-run in the
+  workspace and, if the added tests pass, every `pending_verification` chain is marked verified in its summary.
+- **replan** — one LLM call over the brief + accepted subtasks + failure history; unresolved subtasks are marked
+  `failed` ("— replanned", attempts > 0) or `skipped` ("superseded by replan", never ran); new subtasks appended.
+- **assemble_pr** — combined diff = full-tree compare repo vs workspace (created/deleted files included), final
+  pytest counts, `new_tests_added` from accepted test_writers, status `complete` (all accepted) / `partial`
+  (some) / `failed` (none), and one `PR_PACKAGE` LLM call for `pr_title` + `pr_description`
+  (what/why/how-tested/risks; falls back to a deterministic title if the call fails). `recursion_limit=100`.
+
 ### Data conventions
 
 - `Ticket.as_text()` renders comments oldest-first and the prompts state that later comments
@@ -224,6 +276,9 @@ load_brief ─► read_files ─► plan_fix ─► write_patch ─► apply_pat
   for the pre-existing failures it deliberately left alone. A correct patch for a bug with no covering test comes
   back `applied_unverified` (not `failed`) unless the model adds a passing regression test — then it's `passed`.
   The solver only accepts a local `--repo` directory and leaves its final patched copy in a `solver-<ticket>-…` temp dir.
+- Orchestrator `status: "complete"` means every subtask was accepted — NOT that the suite is green: out-of-scope
+  planted failures still fail in the final counts. The shared workspace (`orch-<ticket>-…/repo`) is left on disk;
+  the CLI prints its path. `code_writer` "passed" is accepted without any LLM evaluation call by design.
 - The Quorum backend must run on **port 8000**: `_run_agent` hard-codes `FakeJiraClient(base_url="http://127.0.0.1:8000")`
   and the UI's `app.js` falls back to `http://localhost:8000` when served from any other port. Run it as a single
   process (the store is a JSON file guarded by an in-process lock).

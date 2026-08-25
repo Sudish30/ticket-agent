@@ -68,6 +68,10 @@ class SolverState(TypedDict, total=False):
     brief_raw: dict               # graph input; validated by load_brief
     brief: TaskBrief
     repo: str                     # local repository directory being fixed
+    workspace: str                # orchestrator mode: existing shared dir patched in place (else absent)
+    src: str                      # source tree for reads/baseline/diffs: workspace if given, else repo
+    snapshot: str                 # workspace mode: pre-solver copy; every attempt resets the workspace to it
+    task_instruction: str         # orchestrator note appended to the plan prompt (scopes the brief)
     codebase: object              # ticket_agent.codebase.Codebase over repo
     files: dict[str, str]         # path -> full content: suspected files + their local imports (capped)
     plan: dict                    # {diagnosis, changes[], risks[]}

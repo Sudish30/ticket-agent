@@ -1,6 +1,7 @@
 """Solver Agent tests. The LLM is stubbed by patching solver_agent.graph._call; pytest genuinely runs on a
 tiny fixture repo (calc.py with a planted bug), so apply/run/judge behaviour is exercised for real.
 """
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -132,6 +133,27 @@ class SolverGraph(SolverBase):
         with self.assertRaises(ValueError) as ctx:
             run({"ticket_id": "X"}, str(self.repo))
         self.assertIn("not a valid TaskBrief", str(ctx.exception))
+
+    def test_workspace_mode_patches_shared_dir_in_place(self):
+        ws = Path(self.tmp.name) / "ws"
+        shutil.copytree(self.repo, ws)
+        with patch("solver_agent.graph._call", side_effect=[PLAN, GOOD]):
+            s = run(BRIEF, str(self.repo), workspace=str(ws))
+        self.assertEqual(s.status, "passed")
+        self.assertIn("return a + b", (ws / "calc.py").read_text())     # patched in the shared workspace
+
+    def test_workspace_mode_restores_on_failure(self):
+        ws = Path(self.tmp.name) / "ws"
+        shutil.copytree(self.repo, ws)
+        with patch("solver_agent.graph._call", side_effect=[PLAN, WRONG, WRONG, WRONG]):
+            s = run(BRIEF, str(self.repo), workspace=str(ws))
+        self.assertEqual(s.status, "failed")
+        self.assertIn("return a - b", (ws / "calc.py").read_text())     # workspace left as it was found
+
+    def test_task_instruction_reaches_plan_prompt(self):
+        with patch("solver_agent.graph._call", side_effect=[PLAN, GOOD]) as call:
+            run(BRIEF, str(self.repo), task_instruction="only fix the TTL, do not write tests")
+        self.assertIn("only fix the TTL, do not write tests", call.call_args_list[0].args[0])
 
 
 class ApplyEdits(unittest.TestCase):

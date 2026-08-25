@@ -3,11 +3,16 @@ You receive a confirmed Task Brief plus the relevant source files, and you produ
 You never expand scope: the brief's acceptance_criteria define what to change; its constraints and out_of_scope
 define what to leave alone, even when you can see other bugs — those are related findings for other tickets."""
 
+TASK_INSTRUCTION_NOTE = """
+Orchestrator instruction for THIS subtask (it narrows the brief — obey it even where the brief is broader):
+{instruction}
+"""
+
 PLAN_FIX = """Plan the fix for this Task Brief.
 
 Task Brief (JSON):
 {brief}
-
+{instruction}
 Relevant source files:
 {files}
 
