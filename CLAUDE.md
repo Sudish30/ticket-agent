@@ -55,7 +55,7 @@ lookup_codebase ──► analyze ──► (nothing left to ask) ──► buil
 | `ticket_agent/codebase.py` | `Codebase.open(spec)` — local dir or GitHub `owner/name[@ref]`; `files`, `tree_text()`, `read()`, `context_text(paths)`; `MAX_FILES=12`, `MAX_FILE_CHARS=6000` |
 | `ticket_agent/channels.py` | `Channel` Protocol `ask(key, contact, message) -> str`; `TerminalChannel`, `ScriptedChannel`, `JiraCommentChannel` |
 | `ticket_agent/jira_client.py` | `JiraClient` (Jira Cloud REST v3), `FakeJiraClient` (same duck type, against the Quorum backend's `/api/tickets` routes), `adf_to_text` (ADF → plain text), `load_mock_ticket` |
-| `quorum_backend/server.py` | FastAPI: JSON ticket store (`quorum_backend/tickets.json`, gitignored), comment thread, `POST /solve` runs the agent in a thread, serves the Quorum UI at `/` |
+| `quorum_backend/server.py` | FastAPI: JSON ticket store (`quorum_backend/tickets.json`, gitignored), comment thread, `POST /solve` (intake retry), `POST /solve-brief` (orchestrator on the stored brief → `pr_package`/`pr_package_md`), serves the Quorum UI at `/` |
 | `main.py` | argparse CLI; `--repo`; writes `brief.json` + `brief.md` (`--out` path with `.md`); `--post-brief` (with `--jira`) posts `brief.to_markdown()` on the ticket |
 | `tests/test_graph.py` | `_is_blanket_defer` cases + `ask_human` ingest-vs-defer paths with mocked LLM |
 | `tests/test_rounds.py` | ask-once rule, sign-off round reservation, `build_brief` assumptions, `analyze` grounding, `lookup_codebase` |
@@ -157,7 +157,11 @@ daemon thread (`_start_agent`); `POST …/solve` is only a manual retry, accepte
 — i.e. the agent talks to its own server over HTTP, posting questions as comments by `JIRA_AGENT_NAME` and waiting for
 any other author's comment. On success: status `Brief ready`, `brief` (dict) + `brief_md` (`to_markdown()`) stored on
 the ticket and the markdown posted as a final comment; on exception: status `Agent error` with the message.
-Ticket keys are `QT-001`, `QT-002`, …
+`POST …/solve-brief` (the Engineer view's **Start solving**) then runs the orchestrator on the stored brief in a
+daemon thread: status `Solving` → `PR ready` (package `complete`) or `Needs human review` (anything else), with
+`pr_package` (dict) + `pr_package_md` stored and the PR markdown posted as a comment; valid from `Brief ready`
+(or `Agent error` with a brief, as a retry). The Solutions screen renders the package (subtask + review tables,
+collapsible combined diff) and polls like the rest. Ticket keys are `QT-001`, `QT-002`, …
 
 ### Solver Agent (`solver_agent/`)
 

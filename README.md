@@ -147,7 +147,10 @@ in `orchestrator/registry.py`.
 
 Flow: **New ticket** → the intake agent starts automatically (status **Clarifying**) and posts grounded questions in the
 ticket's Clarification thread → reply as the reporter → the agent posts its sign-off → reply `confirm` → status
-**Brief ready**.
+**Brief ready** → the Engineer clicks **Start solving** (`POST /solve-brief`), which runs the orchestrator on the
+stored brief (status **Solving**) → status **PR ready** (or **Needs human review** per the package status), the PR
+markdown is posted as a comment, and the Solutions screen shows the package: subtask table, review table, and the
+combined diff in a collapsible block.
 
 The topbar **View as** toggle (remembered in `localStorage` as `quorum-role`, default Reporter) picks the lens:
 - **Reporter** — ticket details, the Clarification thread and the reply box. No solving controls, no brief, no Solutions tab.

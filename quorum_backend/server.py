@@ -4,6 +4,9 @@
     open http://localhost:8000
 
 Creating a ticket starts the intake agent immediately (status "Clarifying"); POST /solve is a manual retry.
+Once a brief is confirmed ("Brief ready"), POST /solve-brief runs the orchestrator (stage 3) on it in a
+background thread: status "Solving" → "PR ready" (package complete) or "Needs human review" (anything else),
+with pr_package + pr_package_md stored on the ticket and the PR markdown posted as a comment.
 
 Env: ANTHROPIC_API_KEY (required), TICKET_AGENT_REPO (default: demo_repo), QUORUM_UI_DIR (default: the Quorum
 checkout — the repo root when this code lives in Quorum/agent/, else ../Quorum next to the ticket-agent repo)
@@ -20,6 +23,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from orchestrator import run as run_orchestrator
 from ticket_agent import run
 from ticket_agent.channels import JiraCommentChannel
 from ticket_agent.jira_client import FakeJiraClient
@@ -90,6 +94,7 @@ def create_ticket(t: NewTicket):
             "assignee": "", "labels": [], "components": [], "linked_issues": [], "epic": "",
             "status": "Clarifying", "created": datetime.now().isoformat(timespec="seconds"),
             "comments": [], "brief": None, "brief_md": "", "error": "",
+            "pr_package": None, "pr_package_md": "",
         }
         _save(d)
     # The intake agent starts automatically on creation; /solve stays as a manual retry after "Agent error".
@@ -142,6 +147,35 @@ def solve(key: str):
     _update(key, status="Clarifying", error="")
     _start_agent(key)
     return {"ok": True, "status": "Clarifying"}
+
+
+# ---------------- orchestrator runner (stage 3) ----------------
+
+def _run_orchestrator(key: str) -> None:
+    try:
+        brief = _get(key).get("brief")
+        if not brief:
+            raise ValueError("ticket has no stored brief")
+        pkg = run_orchestrator(brief, REPO)
+        md = pkg.to_markdown()
+        status = "PR ready" if pkg.status == "complete" else "Needs human review"
+        _update(key, status=status, pr_package=pkg.model_dump(), pr_package_md=md)
+        FakeJiraClient(base_url="http://127.0.0.1:8000").add_comment(key, md, author=AGENT_NAME)
+    except Exception as e:  # surface failures in the UI instead of dying silently
+        traceback.print_exc()
+        _update(key, status="Agent error", error=f"{type(e).__name__}: {e}")
+
+
+@app.post("/api/tickets/{key}/solve-brief")
+def solve_brief(key: str):
+    """Engineer's "Start solving": runs the orchestrator on the ticket's stored brief in a background
+    thread. Valid from "Brief ready" (or as a retry from "Agent error" when a brief already exists)."""
+    t = _get(key)
+    if not (t["status"] == "Brief ready" or (t["status"] == "Agent error" and t.get("brief"))):
+        raise HTTPException(409, f"ticket is {t['status']}" + ("" if t.get("brief") else " and has no brief"))
+    _update(key, status="Solving", error="")
+    threading.Thread(target=_run_orchestrator, args=(key,), daemon=True).start()
+    return {"ok": True, "status": "Solving"}
 
 
 # ---------------- serve the Quorum UI ----------------

@@ -1,12 +1,13 @@
 """quorum_backend.server routes + FakeJiraClient, through FastAPI's TestClient. No network, no LLM, temp store.
 
-_run_agent is patched out: creating a ticket starts it in a thread, and the real one calls the model.
+_run_agent is patched out: creating a ticket starts it in a thread, and the real one calls the model. The
+solve-brief tests patch _run_orchestrator (route) or run_orchestrator + FakeJiraClient (runner) the same way.
 """
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -88,6 +89,56 @@ class QuorumBackend(unittest.TestCase):
             client.transition("QT-001", "Brief ready")
         self.assertEqual(self.tc.get("/api/tickets/QT-001").json()["status"], "Brief ready")
         self.assertEqual(self.tc.get("/api/tickets/nope").status_code, 404)
+
+    def test_solve_brief_requires_brief_ready(self):
+        self.assertEqual(self.tc.post("/api/tickets/QT-404/solve-brief").status_code, 404)
+        self.tc.post("/api/tickets", json={"title": "t"})
+        self._wait_for_agent_calls(1)
+        self.assertEqual(self.tc.post("/api/tickets/QT-001/solve-brief").status_code, 409)   # still clarifying
+
+    def test_solve_brief_starts_orchestrator_and_sets_solving(self):
+        self.tc.post("/api/tickets", json={"title": "t"})
+        self._wait_for_agent_calls(1)
+        server._update("QT-001", status="Brief ready", brief={"ticket_id": "QT-001"})
+        with patch.object(server, "_run_orchestrator") as run_orch:
+            r = self.tc.post("/api/tickets/QT-001/solve-brief")
+            self.assertEqual((r.status_code, r.json()["status"]), (200, "Solving"))
+            for _ in range(300):                  # started on a daemon thread
+                if run_orch.call_count:
+                    break
+                time.sleep(0.01)
+            run_orch.assert_called_once_with("QT-001")
+        self.assertEqual(self.tc.get("/api/tickets/QT-001").json()["status"], "Solving")
+
+    def test_run_orchestrator_stores_package_and_posts_comment(self):
+        from orchestrator.schemas import PRPackage
+        self.tc.post("/api/tickets", json={"title": "t"})
+        self._wait_for_agent_calls(1)
+        server._update("QT-001", status="Solving", brief={"ticket_id": "QT-001"})
+        pkg = PRPackage(ticket_id="QT-001", status="complete", pr_title="QT-001: fix it", pr_description="What/Why")
+        fake_client = MagicMock()
+        with patch.object(server, "run_orchestrator", return_value=pkg) as run_orch, \
+             patch.object(server, "FakeJiraClient", return_value=fake_client):
+            server._run_orchestrator("QT-001")
+        run_orch.assert_called_once_with({"ticket_id": "QT-001"}, server.REPO)
+        t = self.tc.get("/api/tickets/QT-001").json()
+        self.assertEqual(t["status"], "PR ready")
+        self.assertEqual(t["pr_package"]["pr_title"], "QT-001: fix it")
+        self.assertIn("QT-001: fix it", t["pr_package_md"])
+        fake_client.add_comment.assert_called_once()
+        self.assertEqual(fake_client.add_comment.call_args.args[0], "QT-001")
+        self.assertIn("QT-001: fix it", fake_client.add_comment.call_args.args[1])
+
+    def test_run_orchestrator_maps_non_complete_to_needs_human_review(self):
+        from orchestrator.schemas import PRPackage
+        self.tc.post("/api/tickets", json={"title": "t"})
+        self._wait_for_agent_calls(1)
+        server._update("QT-001", status="Solving", brief={"ticket_id": "QT-001"})
+        pkg = PRPackage(ticket_id="QT-001", status="needs_human_review")
+        with patch.object(server, "run_orchestrator", return_value=pkg), \
+             patch.object(server, "FakeJiraClient", return_value=MagicMock()):
+            server._run_orchestrator("QT-001")
+        self.assertEqual(self.tc.get("/api/tickets/QT-001").json()["status"], "Needs human review")
 
     @unittest.skipUnless(server.UI_DIR.is_dir(), "Quorum UI checkout not present next to this repo")
     def test_serves_the_quorum_ui(self):
