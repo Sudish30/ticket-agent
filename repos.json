@@ -4,5 +4,11 @@
     "github": "Sudish30/notely-demo",
     "default_branch": "main",
     "description": "Notely demo Flask app (planted bugs NOTE-142 / NOTE-151 / NOTE-157)"
+  },
+  "finpilot": {
+    "path": "/tmp/finpilot-test/Finpilot/backend",
+    "github": "Sudish30/Finpilot",
+    "default_branch": "main",
+    "description": "FinPilot backend (scratch clone; FIN-203 duplicate-detection bug planted locally)"
   }
 }

@@ -1,0 +1,11 @@
+{
+  "key": "FIN-203",
+  "summary": "App keeps saying my subscriptions are duplicate charges",
+  "description": "A user emailed support saying FinPilot flags their Netflix and their rent as 'Possible duplicate' every single month even though they're obviously just normal monthly payments. Looks bad, makes the anomaly feature feel broken. Can someone look?",
+  "issue_type": "Bug", "priority": "Medium", "labels": ["analytics"], "components": ["backend"],
+  "reporter": "Priya", "assignee": "", "linked_issues": [], "epic": "",
+  "comments": [
+    {"author": "Marcus", "created": "2026-08-22", "body": "Confirmed on my account too — my gym membership shows as duplicate. Same amount every month, different days though."},
+    {"author": "Priya", "created": "2026-08-22", "body": "Genuinely duplicated charges (same day, double-swipe) should still get flagged, that part works and we want to keep it."}
+  ]
+}
