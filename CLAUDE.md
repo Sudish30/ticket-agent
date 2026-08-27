@@ -50,31 +50,35 @@ lookup_codebase ──► analyze ──► (nothing left to ask) ──► buil
 |---|---|
 | `ticket_agent/graph.py` | LangGraph nodes, routing, `build_graph(channel)`, `run(ticket, channel, contact, max_rounds, repo) -> TaskBrief` |
 | `ticket_agent/llm.py` | shared LLM plumbing for both agents: `MODEL`, `make_llm()`, `extract_json()`, `call_json(prompt, system)` (graph modules keep patchable `_llm`/`_call` delegates) |
+| `ticket_agent/sandbox.py` | `run_cmd(workspace, cmd, timeout=30, log=None)` → `{cmd, stdout, stderr, exit_code, duration}` (~4k truncation): shared sandboxed-ish shell for solver investigation + reviewer probes. Guards: refuses `..` and absolute paths outside the workspace (refused = not executed, not logged), clears proxy env (true network isolation would need containers — documented out of scope), budget `MAX_COMMANDS=15` per run enforced on the caller's log list; venv bin prepended to PATH so `python`/`pytest` resolve |
 | `ticket_agent/schemas.py` | `Ticket`/`Comment` (input), `Question`, `ClarificationTurn`, `TaskBrief` (output contract; `.to_markdown()` = brief.md / posted comment, `.as_comment()` = short plain text), `AgentState` |
 | `ticket_agent/prompts.py` | `SYSTEM` + 6 task prompts: `SELECT_FILES`, `ANALYZE`, `ASK_HUMAN`, `INGEST_ANSWER`, `BUILD_BRIEF`, `CONFIRM`; `ROUND_NOTE_FIRST` / `ROUND_NOTE_LATER` slot into `ASK_HUMAN` |
 | `ticket_agent/codebase.py` | `Codebase.open(spec)` — local dir or GitHub `owner/name[@ref]`; `files`, `tree_text()`, `read()`, `context_text(paths)`; `MAX_FILES=12`, `MAX_FILE_CHARS=6000` |
 | `ticket_agent/channels.py` | `Channel` Protocol `ask(key, contact, message) -> str`; `TerminalChannel`, `ScriptedChannel`, `JiraCommentChannel` |
 | `ticket_agent/jira_client.py` | `JiraClient` (Jira Cloud REST v3), `FakeJiraClient` (same duck type, against the Quorum backend's `/api/tickets` routes), `adf_to_text` (ADF → plain text), `load_mock_ticket` |
-| `quorum_backend/server.py` | FastAPI: JSON ticket store (`quorum_backend/tickets.json`, gitignored), comment thread, `POST /solve` (intake retry), `POST /solve-brief` (orchestrator on the stored brief → `pr_package`/`pr_package_md`), serves the Quorum UI at `/` |
+| `quorum_backend/server.py` | FastAPI: JSON ticket store (`quorum_backend/tickets.json`, gitignored), comment thread, `POST /solve` (intake retry), `POST /solve-brief` (orchestrator on the stored brief → `pr_package`/`pr_package_md`), serves the Quorum UI at `/`; `POST …/open-pr` (real GitHub PR from the stored package via `github_pr.py`) |
+| `quorum_backend/github_pr.py` | `open_pr_from_package(pkg, remote, key)`: clone the GitHub remote, branch `agent/<key>-<slug>`, `git apply` the package's combined diff (`_retarget_new_files` rewrites `--- a/<path>` to `/dev/null` for files the run created — difflib doesn't), commit as "Ticket Agent", push, `gh pr create` → PR URL; all subprocess calls go through the patchable `_run` seam |
+| `repos.json` | repo mapping: name → `{path, github, default_branch}` (Notely: `demo_repo` ↔ `Sudish30/notely-demo`); `_repo_entry()` matches the entry whose `path` resolves to `REPO` |
 | `main.py` | argparse CLI; `--repo`; writes `brief.json` + `brief.md` (`--out` path with `.md`); `--post-brief` (with `--jira`) posts `brief.to_markdown()` on the ticket |
 | `tests/test_graph.py` | `_is_blanket_defer` cases + `ask_human` ingest-vs-defer paths with mocked LLM |
 | `tests/test_rounds.py` | ask-once rule, sign-off round reservation, `build_brief` assumptions, `analyze` grounding, `lookup_codebase` |
 | `tests/test_markdown.py` | `TaskBrief.to_markdown()` section order, checklist, table escaping, collapsed Q&A, empty sections |
 | `tests/test_quorum_backend.py` | backend routes + `FakeJiraClient` via FastAPI `TestClient` (temp store, `requests` shimmed into the client); UI-serving test skips without `../Quorum` |
-| `solver_agent/graph.py` | solver nodes + routing; `run(brief, repo, max_attempts) -> Solution`; `apply_edits` / `PatchError` |
+| `solver_agent/graph.py` | solver nodes + routing incl. `investigate` (sandboxed bug reproduction); `run(brief, repo, max_attempts) -> Solution`; `apply_edits` / `PatchError` |
 | `solver_agent/schemas.py` | `Edit`, `Solution` (output contract; `.to_markdown()` = solution.md), `SolverState` |
 | `solver_agent/prompts.py` | solver `SYSTEM` + `PLAN_FIX`, `WRITE_PATCH`; `RETRY_NOTE` slots into `WRITE_PATCH` |
 | `solver_agent/main.py` | CLI `python -m solver_agent.main brief.json --repo demo_repo`; writes `solution.json` + `solution.md` |
-| `tests/test_solver.py` | stubbed-LLM solver runs on a tiny fixture repo with real pytest: first-try pass, retry with feedback, patch-error feedback, zero/multi-match errors, exhausted-but-honest, new-test-passes → passed, applied_unverified + short-circuit, affected_areas prose paths in context, workspace mode (in-place patch + restore-on-failure), task_instruction |
+| `tests/test_solver.py` | stubbed-LLM solver runs on a tiny fixture repo with real pytest: first-try pass, retry with feedback, patch-error feedback, zero/multi-match errors, exhausted-but-honest, new-test-passes → passed, applied_unverified + short-circuit, affected_areas prose paths in context, workspace mode (in-place patch + restore-on-failure), task_instruction, investigate (commands executed + findings ground plan_fix; budget exhaustion → forced wrap-up) |
+| `tests/test_sandbox.py` | `run_cmd` guards for real: path escape + `..` refused (and not logged), in-workspace absolute allowed, budget enforced, truncation, nonzero exit reported not raised, proxy env cleared, venv `python` on PATH |
 | `orchestrator/graph.py` | tech-lead nodes + routing; `run(brief, repo, max_retries, max_replans) -> PRPackage`; shared-workspace creation, status-aware `evaluate`, `replan`, `assemble_pr` |
 | `orchestrator/registry.py` | `WORKERS` dict + `@register(name, description)` decorator (adding docs_writer = one function); `code_writer` (wraps `solver_agent.graph.run` with `task_instruction`/`workspace`) |
 | `orchestrator/workers/test_writer.py` | small LangGraph worker: LLM writes pytest edits (modify with exact old_str, or create with old_str "") under `tests/` only, applies them in the workspace, pre/post pytest, restores everything it touched on failure |
-| `orchestrator/workers/reviewer.py` | the mandatory final review gate (registered, but invoked by `review_gate`, never planned): one `REVIEW` LLM call over brief + diff + full changed-file contents + tests — never the workers' rationales; returns verdict/checks/change_requests, blockers authoritative |
+| `orchestrator/workers/reviewer.py` | the mandatory final review gate (registered, but invoked by `review_gate`, never planned): probes first — ≤4 self-chosen sandbox commands in a scratch copy of the workspace (run the suite, write+run its own probe tests; scratch is discarded, probe files never enter the diff) plus the deterministic discrimination check (revert the fix in the scratch, re-run the new tests, confirm they FAIL; recorded in the tests_assert_acs note as "empirically verified" vs "reasoned") — then one `REVIEW` LLM call over brief + diff + full changed-file contents + tests + probe transcript — never the workers' rationales; returns verdict/checks/change_requests + `probe_log`, blockers authoritative |
 | `orchestrator/workers/docs_writer.py` | comment/docstring/CHANGELOG documentation for files the run changed; `comment_only_change` guard (code skeletons: triple-quoted blocks collapsed, quote-aware `#`-stripping, blank lines dropped) rejects any edit touching executable code; appends the changelog under `## <ticket>`; restores on failure |
 | `orchestrator/schemas.py` | `Subtask` (internal, mutated in place), `SubtaskReport`, `PRPackage` (output contract; `.to_markdown()` = pr_package.md), `OrchestratorState` |
 | `orchestrator/prompts.py` | orchestrator `SYSTEM` + `PLAN_SUBTASKS`, `EVALUATE` (+`POLICY_FAILED`), `REPLAN`, `WRITE_TESTS`, `PR_PACKAGE`; `FEEDBACK_NOTE` slots into `WRITE_TESTS` |
 | `orchestrator/main.py` | CLI `python -m orchestrator.main brief.json --repo demo_repo`; prints the plan JSON + per-subtask outcomes; writes `pr_package.json` + `pr_package.md` |
-| `tests/test_orchestrator.py` | stubbed graph-LLM + registry-patched fake workers on the fixture repo: dependency ordering, the three status routes, retry-with-feedback, retry-exhausted → one replan → partial, PR assembly with real diff/pytest, review gate (approve / blocker→repair→approve / still-blocked→needs_human_review / minors-only / planned-reviewer dropped) |
+| `tests/test_orchestrator.py` | stubbed graph-LLM + registry-patched fake workers on the fixture repo: dependency ordering, the three status routes, retry-with-feedback, retry-exhausted → one replan → partial, PR assembly with real diff/pytest, review gate (approve / blocker→repair→approve / still-blocked→needs_human_review / minors-only / planned-reviewer dropped), real-reviewer probes (scratch-copy suite run logged, discrimination revert-check "empirically verified" / trivial test caught as "empirical check FAILED"), investigation surfaced in PRPackage + markdown |
 | `mock_tickets/*.json` | `Ticket`-shaped fixtures: `PROJ-142` (standalone), `NOTE-142/151/157` (describe bugs planted in `demo_repo/`) |
 | `demo_repo/` | Notely, a tiny Flask app: NOTE-142 → `auth/session.py` SameSite=Strict; NOTE-151 → `forms/validators.py` email regex; NOTE-157 → `auth/tokens.py` TTL in minutes compared to seconds |
 | `INTEGRATION.md` | the 4 Jira REST routes a fake Jira / custom ticket UI must implement for `--jira` mode |
@@ -161,14 +165,19 @@ the ticket and the markdown posted as a final comment; on exception: status `Age
 daemon thread: status `Solving` → `PR ready` (package `complete`) or `Needs human review` (anything else), with
 `pr_package` (dict) + `pr_package_md` stored and the PR markdown posted as a comment; valid from `Brief ready`
 (or `Agent error` with a brief, as a retry). The Solutions screen renders the package (subtask + review tables,
-collapsible combined diff) and polls like the rest. Ticket keys are `QT-001`, `QT-002`, …
+collapsible combined diff) and polls like the rest. Once a `pr_package` exists, its **Open PR on GitHub** button calls
+`POST …/open-pr`: status `Opening PR` → a daemon thread runs `open_pr_from_package` against the `repos.json` remote →
+on success status `PR opened`, `pr_url` stored, `Opened PR: <url>` posted as a comment, and the button becomes a link
+to the PR; on failure the status reverts (so the button retries) with the message in `error`. 409 when there is no
+package, a PR is already open, or one is being opened. Ticket keys are `QT-001`, `QT-002`, …
 
 ### Solver Agent (`solver_agent/`)
 
 ```
-load_brief ─► read_files ─► plan_fix ─► write_patch ─► apply_patch ─► run_tests ─► emit_solution ─► END
-                                            ▲                              │ (retry: new failures, patch errors,
-                                            └──────────────────────────────┘  or in-scope failures remain; max 3)
+load_brief ─► read_files ─► investigate ─► plan_fix ─► write_patch ─► apply_patch ─► run_tests ─► emit_solution ─► END
+                                 ▲ (≤6 cmds)                  ▲                          │ (retry: new failures, patch errors,
+                                 └────────────────────────────┴──────────────────────────┘  or in-scope failures remain; max 3;
+                                    (retry re-enters investigate in retry mode, ≤2 diagnostic commands, then write_patch)
 ```
 
 - **load_brief** — `TaskBrief.model_validate` on the input, fails loudly on malformed briefs; requires a *local*
@@ -178,7 +187,16 @@ load_brief ─► read_files ─► plan_fix ─► write_patch ─► apply_pat
   from prose), plus the repo-local modules they import (breadth-first), capped at `MAX_CONTEXT_FILES = 15`; full
   contents from disk (not `Codebase.read`, which truncates at 6000 chars). Also runs the **baseline pytest** once
   on a pristine copy (`baseline_failed` + `baseline_counts`) so plan_fix can classify pre-existing failures.
+- **investigate** — sandboxed live reproduction BEFORE planning: a loop (≤ `MAX_INVESTIGATE_CMDS=6` commands) where
+  the LLM picks `{action: run|done, cmd, reason}`; each command runs via `sandbox.run_cmd` in a throwaway scratch
+  copy of `src` and its result is fed back. Exits with structured findings `{reproduced: yes|no, observed_error,
+  evidence}` (budget exhaustion forces an `INVESTIGATE_WRAPUP` summary call). On a retry the same node runs in
+  retry mode (≤ `MAX_RETRY_PROBE_CMDS=2` commands, `INVESTIGATE_RETRY` prompt over the failed attempt) and its
+  transcript rides into the retry `WRITE_PATCH` prompt (`retry_findings`). Executed commands accumulate in
+  `execution_log` (phase-tagged); `Solution.investigation` = findings + command log.
 - **plan_fix** — one JSON call → `{diagnosis, changes: [{path, what, why}], risks, out_of_scope_failures}`; gets the
+  investigation findings + command transcript and must ground the diagnosis in the observed behavior when
+  reproduction succeeded; gets the
   baseline failing test ids and must classify each as covered by the brief or not (`out_of_scope_failures` must stay
   failing); must obey the brief's constraints / out_of_scope / related_findings and only plan files that serve the
   acceptance criteria. Binding rule in the prompt: flipping an unrelated failing test never counts as success.
@@ -249,6 +267,10 @@ load_brief ─► plan_subtasks ─► dispatch ─► evaluate ─► (all reso
   with brief + combined diff + full post-change contents of every changed file + test results (NOT the workers'
   rationales — independent judgment); the `REVIEW` prompt demands 5 named checks (acceptance_criteria — quote
   each AC and point at the diff line, constraints, out_of_scope, regressions_security, tests_assert_acs).
+  Before the verdict the reviewer PROBES: ≤4 sandbox commands in a scratch copy (suite runs, its own probe
+  tests) + the deterministic discrimination check (fix reverted in the scratch → new tests must FAIL), whose
+  result is stamped onto the tests_assert_acs note ("empirically verified" / "empirical check FAILED" /
+  "reasoned"); the probe transcript goes into the `REVIEW` prompt and `Review.probe_log`.
   Blockers are authoritative over the raw verdict. Blockers + repair round unspent → `repair` turns them into
   ONE scoped subtask (`repair-<n>`; test_writer iff every blocker file is under `tests/`, else code_writer) and
   hands it back to dispatch; then reassemble + re-review once. `finalize` normalizes the review onto the
@@ -308,6 +330,13 @@ load_brief ─► plan_subtasks ─► dispatch ─► evaluate ─► (all reso
 - The served UI defaults to the bundled `ui/` folder — edits to a `../Quorum` checkout do NOT show up unless you
   run with `QUORUM_UI_DIR=../Quorum` or re-copy the four files (`index.html`, `app.js`, `styles.css`, `tokens.css`)
   into `ui/`.
+- `open-pr` needs the `gh` CLI authenticated with push rights on the `repos.json` remote. The PR is built from the
+  package's stored `combined_diff`, not the workspace — a stale remote `main` that has drifted from the local repo
+  copy will make `git apply` fail (surfaced in `error`, status reverts).
+- `sandbox.run_cmd` is guards-plus-hygiene, NOT real isolation: no network namespace/container — a determined
+  command can still reach the network. The guards block path escapes and `..`; `/dev/null` and other absolute
+  paths are refused too (prompts tell the models to use relative paths). `python` works inside sandbox commands
+  because the venv bin dir is prepended to PATH (this machine has no bare `python` otherwise).
 
 ## Planned (from README, not implemented)
 

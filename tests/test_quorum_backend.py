@@ -140,6 +140,56 @@ class QuorumBackend(unittest.TestCase):
             server._run_orchestrator("QT-001")
         self.assertEqual(self.tc.get("/api/tickets/QT-001").json()["status"], "Needs human review")
 
+    def test_open_pr_requires_package_and_no_existing_pr(self):
+        self.assertEqual(self.tc.post("/api/tickets/QT-404/open-pr").status_code, 404)
+        self.tc.post("/api/tickets", json={"title": "t"})
+        self._wait_for_agent_calls(1)
+        self.assertEqual(self.tc.post("/api/tickets/QT-001/open-pr").status_code, 409)     # no pr_package yet
+        server._update("QT-001", status="PR ready", pr_package={"pr_title": "T"},
+                       pr_url="https://github.com/x/y/pull/1")
+        self.assertEqual(self.tc.post("/api/tickets/QT-001/open-pr").status_code, 409)     # already opened
+
+    def test_open_pr_starts_thread_and_sets_opening(self):
+        self.tc.post("/api/tickets", json={"title": "t"})
+        self._wait_for_agent_calls(1)
+        server._update("QT-001", status="PR ready", pr_package={"pr_title": "T"})
+        with patch.object(server, "_open_pr") as opener:
+            r = self.tc.post("/api/tickets/QT-001/open-pr")
+            self.assertEqual((r.status_code, r.json()["status"]), (200, "Opening PR"))
+            for _ in range(300):                  # started on a daemon thread
+                if opener.call_count:
+                    break
+                time.sleep(0.01)
+            opener.assert_called_once_with("QT-001", "PR ready")
+        self.assertEqual(self.tc.get("/api/tickets/QT-001").json()["status"], "Opening PR")
+
+    def test_open_pr_runner_stores_url_and_posts_comment(self):
+        self.tc.post("/api/tickets", json={"title": "t"})
+        self._wait_for_agent_calls(1)
+        server._update("QT-001", status="Opening PR", pr_package={"pr_title": "T", "combined_diff": "d"})
+        fake_client = MagicMock()
+        with patch.object(server, "open_pr_from_package",
+                          return_value="https://github.com/Sudish30/notely-demo/pull/7") as opener, \
+             patch.object(server, "FakeJiraClient", return_value=fake_client):
+            server._open_pr("QT-001", "PR ready")
+        opener.assert_called_once()
+        self.assertEqual(opener.call_args.args[1], "Sudish30/notely-demo")   # remote resolved via repos.json
+        t = self.tc.get("/api/tickets/QT-001").json()
+        self.assertEqual((t["status"], t["pr_url"]),
+                         ("PR opened", "https://github.com/Sudish30/notely-demo/pull/7"))
+        self.assertIn("pull/7", fake_client.add_comment.call_args.args[1])
+
+    def test_open_pr_runner_failure_reverts_status(self):
+        self.tc.post("/api/tickets", json={"title": "t"})
+        self._wait_for_agent_calls(1)
+        server._update("QT-001", status="Opening PR", pr_package={"pr_title": "T"})
+        with patch.object(server, "open_pr_from_package", side_effect=RuntimeError("gh exploded")), \
+             patch.object(server, "FakeJiraClient", return_value=MagicMock()):
+            server._open_pr("QT-001", "PR ready")
+        t = self.tc.get("/api/tickets/QT-001").json()
+        self.assertEqual(t["status"], "PR ready")                            # reverts so the button can retry
+        self.assertIn("gh exploded", t["error"])
+
     @unittest.skipUnless(server.UI_DIR.is_dir(), "no UI dir (bundled ui/ missing and QUORUM_UI_DIR unset)")
     def test_serves_the_quorum_ui(self):
         r = self.tc.get("/")

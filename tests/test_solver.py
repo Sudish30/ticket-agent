@@ -1,5 +1,8 @@
 """Solver Agent tests. The LLM is stubbed by patching solver_agent.graph._call; pytest genuinely runs on a
 tiny fixture repo (calc.py with a planted bug), so apply/run/judge behaviour is exercised for real.
+
+Since the investigate node, every run starts with ≥1 investigate reply (INV_DONE = "no commands, here are my
+findings"), and every retry inserts one retry-investigate reply (INV_RETRY_DONE) before its write_patch.
 """
 import shutil
 import tempfile
@@ -20,6 +23,12 @@ BRIEF = {
 
 PLAN = {"diagnosis": "calc.py · add() uses '-' instead of '+'.",
         "changes": [{"path": "calc.py", "what": "use +", "why": "test_add"}], "risks": []}
+
+INV_DONE = {"action": "done", "findings": {"reproduced": "yes", "observed_error": "test_add fails: -1 != 5",
+                                           "evidence": "add() subtracts instead of adding"}}
+INV_RETRY_DONE = {"action": "done", "findings": {"reproduced": "yes", "observed_error": "",
+                                                 "evidence": "the edit used the wrong operator"}}
+RUN_ECHO = {"action": "run", "cmd": "echo probing", "reason": "look around"}
 
 
 def _edits(new_str, old_str="    return a - b"):
@@ -62,70 +71,99 @@ class SolverBase(unittest.TestCase):
 
 class SolverGraph(SolverBase):
     def test_first_attempt_success(self):
-        s, call = self._run(PLAN, GOOD)
+        s, call = self._run(INV_DONE, PLAN, GOOD)
         self.assertEqual((s.status, s.attempts, s.files_changed), ("passed", 1, ["calc.py"]))
         self.assertIn("-    return a - b", s.diff)
         self.assertIn("+    return a + b", s.diff)
         self.assertIn("a/calc.py", s.diff)
         self.assertGreaterEqual(s.tests_passed, 1)
         self.assertEqual(s.tests_failed, 0)
-        self.assertEqual(call.call_count, 2)                       # plan + one patch
+        self.assertEqual(call.call_count, 3)                       # investigate + plan + one patch
         md = s.to_markdown()
         self.assertIn("# QT-9 — Solution (passed, 1 attempt", md)
         self.assertIn("```diff", md)
         self.assertIn("`calc.py`", md)
 
     def test_fail_then_pass_feeds_error_back(self):
-        s, call = self._run(PLAN, WRONG, GOOD)
+        s, call = self._run(INV_DONE, PLAN, WRONG, INV_RETRY_DONE, GOOD)
         self.assertEqual((s.status, s.attempts), ("passed", 2))
-        retry_prompt = call.call_args_list[2].args[0]              # 3rd call = write_patch attempt 2
+        probe_prompt = call.call_args_list[3].args[0]              # 4th call = retry investigate
+        self.assertIn("return a * b", probe_prompt)                # sees the failed edits
+        self.assertIn("test_add", probe_prompt)                    # and the failure output
+        retry_prompt = call.call_args_list[4].args[0]              # 5th call = write_patch attempt 2
         self.assertIn("return a * b", retry_prompt)                # previous edits included
         self.assertIn("test_add", retry_prompt)                    # test output included
         self.assertIn("APPROACH", retry_prompt)                    # fix-vs-approach diagnosis instruction
+        self.assertIn("the edit used the wrong operator", retry_prompt)   # retry-probe findings ride along
         self.assertIn("+    return a + b", s.diff)                 # final diff comes from a fresh copy
 
     def test_patch_error_is_a_failed_attempt_and_fed_back(self):
-        s, call = self._run(PLAN, NO_MATCH, GOOD)
+        s, call = self._run(INV_DONE, PLAN, NO_MATCH, INV_RETRY_DONE, GOOD)
         self.assertEqual((s.status, s.attempts), ("passed", 2))
-        retry_prompt = call.call_args_list[2].args[0]
+        retry_prompt = call.call_args_list[4].args[0]
         self.assertIn("PATCH ERROR", retry_prompt)
         self.assertIn("old_str not found", retry_prompt)
 
     def test_attempts_exhausted_is_honest(self):
-        s, call = self._run(PLAN, WRONG, WRONG, WRONG)
+        s, call = self._run(INV_DONE, PLAN, WRONG, INV_RETRY_DONE, WRONG, INV_RETRY_DONE, WRONG)
         self.assertEqual((s.status, s.attempts), ("failed", 3))
-        self.assertEqual(call.call_count, 4)                       # plan + 3 patches, then stop
+        self.assertEqual(call.call_count, 7)                       # inv + plan + 3 patches + 2 retry-invs
         self.assertIn("test_add", s.test_output_tail)              # the real failing output, no success claim
         self.assertIn("Gave up after 3 attempt(s)", s.rationale)
         self.assertEqual(s.tests_failed, 1)
         self.assertIn("(failed, 3 attempts", s.to_markdown().splitlines()[0])
 
     def test_new_passing_test_counts_as_verification(self):
-        s, call = self._run(PLAN_OOS, NEW_TEST)
+        s, call = self._run(INV_DONE, PLAN_OOS, NEW_TEST)
         self.assertEqual((s.status, s.attempts), ("passed", 1))
-        self.assertEqual(call.call_count, 2)
+        self.assertEqual(call.call_count, 3)
         self.assertIn("newly-added passing test", s.rationale)
 
     def test_nothing_verifiable_is_applied_unverified(self):
-        s, _ = self._run(PLAN_OOS, COMMENT_ONLY)
+        s, _ = self._run(INV_DONE, PLAN_OOS, COMMENT_ONLY)
         self.assertEqual((s.status, s.attempts), ("applied_unverified", 1))
         self.assertIn("cannot verify", s.rationale)
         self.assertIn("(applied_unverified, 1 attempt", s.to_markdown().splitlines()[0])
 
     def test_short_circuit_no_retries_when_only_out_of_scope_failures_remain(self):
-        s, call = self._run(PLAN_OOS, COMMENT_ONLY, GOOD, GOOD)   # spare stubs must never be consumed
-        self.assertEqual(call.call_count, 2)                      # plan + one patch: a settled patch is not re-solved
+        s, call = self._run(INV_DONE, PLAN_OOS, COMMENT_ONLY, GOOD, GOOD)   # spare stubs never consumed
+        self.assertEqual(call.call_count, 3)                      # inv + plan + one patch: settled, not re-solved
         self.assertEqual(s.status, "applied_unverified")
+
+    def test_investigate_runs_commands_then_done(self):
+        s, call = self._run(RUN_ECHO,
+                            {"action": "run", "cmd": 'python -c "print(\'bug seen\')"', "reason": "show it"},
+                            INV_DONE, PLAN, GOOD)
+        self.assertEqual(s.status, "passed")
+        inv = s.investigation
+        self.assertEqual(inv["reproduced"], "yes")
+        self.assertEqual([c["cmd"] for c in inv["commands"]],
+                         ["echo probing", 'python -c "print(\'bug seen\')"'])
+        self.assertEqual(inv["commands"][0]["exit_code"], 0)
+        self.assertIn("probing", inv["commands"][0]["stdout"])
+        self.assertEqual({c["phase"] for c in inv["commands"]}, {"initial"})
+        plan_prompt = call.call_args_list[3].args[0]
+        self.assertIn("add() subtracts instead of adding", plan_prompt)   # findings ground plan_fix
+        self.assertIn("echo probing", plan_prompt)                        # and the command log rides along
+        self.assertIn("## Investigation", s.to_markdown())
+
+    def test_investigate_budget_exhaustion_forces_findings(self):
+        wrap = {"findings": {"reproduced": "no", "observed_error": "", "evidence": "budget spent, inconclusive"}}
+        s, call = self._run(*([RUN_ECHO] * 6), wrap, PLAN, GOOD)
+        self.assertEqual(s.status, "passed")
+        self.assertEqual(call.call_count, 9)                       # 6 runs + wrap-up + plan + patch
+        self.assertEqual(len(s.investigation["commands"]), 6)      # the budget, fully spent and logged
+        self.assertEqual(s.investigation["evidence"], "budget spent, inconclusive")
 
     def test_affected_areas_paths_are_read_into_context(self):
         (self.repo / "notes.py").write_text("x = 1\n")
         brief = {**BRIEF,
                  "suspected_files": [{"path": "notes.py", "reason": "misleading", "confidence": 0.9}],
                  "affected_areas": ["calc.py · add() subtracts instead of adding"]}
-        with patch("solver_agent.graph._call", side_effect=[PLAN, GOOD]) as call:
+        with patch("solver_agent.graph._call", side_effect=[INV_DONE, PLAN, GOOD]) as call:
             s = run(brief, str(self.repo))
         self.assertEqual(s.status, "passed")
-        plan_prompt = call.call_args_list[0].args[0]
+        plan_prompt = call.call_args_list[1].args[0]
         self.assertIn("===== calc.py =====", plan_prompt)         # pulled from affected_areas prose, not imports
         self.assertIn("return a - b", plan_prompt)
 
@@ -137,7 +175,7 @@ class SolverGraph(SolverBase):
     def test_workspace_mode_patches_shared_dir_in_place(self):
         ws = Path(self.tmp.name) / "ws"
         shutil.copytree(self.repo, ws)
-        with patch("solver_agent.graph._call", side_effect=[PLAN, GOOD]):
+        with patch("solver_agent.graph._call", side_effect=[INV_DONE, PLAN, GOOD]):
             s = run(BRIEF, str(self.repo), workspace=str(ws))
         self.assertEqual(s.status, "passed")
         self.assertIn("return a + b", (ws / "calc.py").read_text())     # patched in the shared workspace
@@ -145,15 +183,16 @@ class SolverGraph(SolverBase):
     def test_workspace_mode_restores_on_failure(self):
         ws = Path(self.tmp.name) / "ws"
         shutil.copytree(self.repo, ws)
-        with patch("solver_agent.graph._call", side_effect=[PLAN, WRONG, WRONG, WRONG]):
+        with patch("solver_agent.graph._call",
+                   side_effect=[INV_DONE, PLAN, WRONG, INV_RETRY_DONE, WRONG, INV_RETRY_DONE, WRONG]):
             s = run(BRIEF, str(self.repo), workspace=str(ws))
         self.assertEqual(s.status, "failed")
         self.assertIn("return a - b", (ws / "calc.py").read_text())     # workspace left as it was found
 
     def test_task_instruction_reaches_plan_prompt(self):
-        with patch("solver_agent.graph._call", side_effect=[PLAN, GOOD]) as call:
+        with patch("solver_agent.graph._call", side_effect=[INV_DONE, PLAN, GOOD]) as call:
             run(BRIEF, str(self.repo), task_instruction="only fix the TTL, do not write tests")
-        self.assertIn("only fix the TTL, do not write tests", call.call_args_list[0].args[0])
+        self.assertIn("only fix the TTL, do not write tests", call.call_args_list[1].args[0])
 
 
 class ApplyEdits(unittest.TestCase):

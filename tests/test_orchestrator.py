@@ -12,6 +12,7 @@ from unittest.mock import patch
 from orchestrator import registry
 from orchestrator.graph import run
 from orchestrator.workers.docs_writer import comment_only_change, docs_writer
+from orchestrator.workers.reviewer import reviewer as real_reviewer
 from ticket_agent.schemas import TaskBrief
 
 BRIEF = {
@@ -280,6 +281,82 @@ class ReviewGate(OrchestratorBase):
         pr, call = self._run({"code_writer": cw}, [plan, PR_STUB])
         self.assertEqual([s.worker for s in pr.subtasks], ["code_writer"])   # the gate is never a planned subtask
         self.assertEqual(pr.status, "complete")
+
+
+class InvestigationSurface(OrchestratorBase):
+    def test_investigation_surfaces_in_pr_package(self):
+        cw = scripted_worker({"status": "passed", "summary": "fixed",
+                              "investigation": {"reproduced": "yes", "observed_error": "1 failed",
+                                                "evidence": "ran the failing test and saw it",
+                                                "commands": [{"cmd": "python -m pytest -q", "exit_code": 1,
+                                                              "stdout": "1 failed", "stderr": "",
+                                                              "duration": 0.1, "phase": "initial"}]}})
+        pr, call = self._run({"code_writer": cw}, [PLAN_CODE_ONLY, PR_STUB])
+        self.assertEqual(len(pr.investigation), 1)
+        self.assertEqual(pr.investigation[0]["subtask"], "s1")
+        self.assertEqual(pr.investigation[0]["reproduced"], "yes")
+        md = pr.to_markdown()
+        self.assertIn("## Investigation", md)
+        self.assertIn("reproduced: yes", md)
+        self.assertIn("<details><summary>Command log", md)
+        self.assertIn("python -m pytest -q", md)
+
+
+class ReviewerProbe(OrchestratorBase):
+    """The REAL reviewer worker, with only its LLM stubbed: probes and the revert-check genuinely run."""
+
+    def _ctx(self, new_tests=()):
+        ws = Path(self.tmp.name) / "ws"
+        shutil.copytree(self.repo, ws)
+        p = ws / "calc.py"
+        p.write_text(p.read_text().replace("a - b", "a + b"))          # the "fix" is applied in the workspace
+        files = {"calc.py": p.read_text()}
+        if new_tests:
+            (ws / "tests" / "test_new.py").write_text(
+                "from calc import add\n\n\ndef test_add_regression():\n    assert add(2, 3) == 5\n")
+            files["tests/test_new.py"] = (ws / "tests" / "test_new.py").read_text()
+        return {"brief": TaskBrief.model_validate(BRIEF), "repo": str(self.repo), "workspace": str(ws),
+                "diff": "--- a/calc.py\n+++ b/calc.py\n-    return a - b\n+    return a + b\n",
+                "files": files, "tests_passed": 2, "tests_failed": 0,
+                "new_tests": list(new_tests), "failing_tests": [], "baseline_failed": ["tests/test_calc.py::test_add"]}
+
+    def test_probe_commands_run_in_scratch_and_are_logged(self):
+        ctx = self._ctx()
+        replies = [{"action": "run", "cmd": "python -m pytest -q", "reason": "run the suite myself"},
+                   {"action": "done"},
+                   APPROVE_REVIEW]
+        with patch("orchestrator.workers.reviewer._call", side_effect=replies) as call:
+            res = real_reviewer(ctx)
+        self.assertEqual(res["verdict"], "approve")
+        self.assertEqual(len(res["probe_log"]), 1)                     # one probe; no revert-check without new tests
+        self.assertEqual(res["probe_log"][0]["cmd"], "python -m pytest -q")
+        self.assertEqual(res["probe_log"][0]["exit_code"], 0)          # the fixed scratch suite is green
+        review_prompt = call.call_args_list[-1].args[0]
+        self.assertIn("python -m pytest -q", review_prompt)            # probe transcript shown to the reviewer
+        note = next(c["note"] for c in res["checks"] if c["name"] == "tests_assert_acs")
+        self.assertIn("reasoned", note)                                # no new tests → no empirical check
+
+    def test_discrimination_check_verified_empirically(self):
+        ctx = self._ctx(new_tests=["tests/test_new.py::test_add_regression"])
+        replies = [{"action": "done"}, APPROVE_REVIEW]
+        with patch("orchestrator.workers.reviewer._call", side_effect=replies):
+            res = real_reviewer(ctx)
+        self.assertEqual(len(res["probe_log"]), 1)                     # just the deterministic revert-check
+        self.assertIn("pytest", res["probe_log"][0]["cmd"])
+        self.assertNotEqual(res["probe_log"][0]["exit_code"], 0)       # the new test FAILS on reverted code
+        note = next(c["note"] for c in res["checks"] if c["name"] == "tests_assert_acs")
+        self.assertIn("empirically verified", note)
+        self.assertIn("a + b", (Path(ctx["workspace"]) / "calc.py").read_text())   # real workspace untouched
+
+    def test_discrimination_check_catches_non_discriminating_tests(self):
+        ctx = self._ctx(new_tests=["tests/test_new.py::test_trivial"])
+        (Path(ctx["workspace"]) / "tests" / "test_new.py").write_text("def test_trivial():\n    assert True\n")
+        replies = [{"action": "done"}, APPROVE_REVIEW]
+        with patch("orchestrator.workers.reviewer._call", side_effect=replies):
+            res = real_reviewer(ctx)
+        note = next(c["note"] for c in res["checks"] if c["name"] == "tests_assert_acs")
+        self.assertIn("still PASS", note)                              # trivial test survives the revert = no proof
+        self.assertIn("empirical check FAILED", note)
 
 
 class DocsGuard(unittest.TestCase):

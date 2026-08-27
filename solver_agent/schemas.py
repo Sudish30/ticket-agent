@@ -33,6 +33,9 @@ class Solution(BaseModel):
     tests_failed: int = 0
     test_output_tail: str = Field(default="", description="Last 30 lines of the final pytest run (or the patch error).")
     rationale: str = ""
+    investigation: dict = Field(
+        default_factory=dict,
+        description="Live investigation: {reproduced, observed_error, evidence, commands: [sandbox results]}.")
     duration_seconds: float = 0.0
 
     def to_markdown(self) -> str:
@@ -61,6 +64,18 @@ class Solution(BaseModel):
             "", "## Diff", "```diff", self.diff.rstrip() or "(empty)", "```",
             "", "## Test output (tail)", "```", self.test_output_tail.rstrip() or "(none)", "```",
         ]
+        if self.investigation:
+            cmds = self.investigation.get("commands") or []
+            out += ["", "## Investigation",
+                    f"_Reproduced: {self.investigation.get('reproduced', 'no')}_ — "
+                    f"{self.investigation.get('evidence', '') or '(no findings recorded)'}"]
+            if self.investigation.get("observed_error"):
+                out += ["", f"Observed: {str(self.investigation['observed_error'])[:300]}"]
+            if cmds:
+                out += ["", f"<details><summary>Command log ({len(cmds)} command(s))</summary>", "", "```"]
+                for r in cmds:
+                    out.append(f"[{r.get('phase', '')}] $ {r.get('cmd')}  -> exit {r.get('exit_code')}")
+                out += ["```", "", "</details>"]
         return "\n".join(out) + "\n"
 
 
@@ -91,5 +106,8 @@ class SolverState(TypedDict, total=False):
     new_tests_passed: int         # tests the patch added that pass (credit for self-written regression tests)
     remaining_failures: list[str] # pre-existing failures the patch (correctly) leaves alone
     history: list[dict]           # one {edits, result} entry per attempt, fed back into retries
+    investigation: dict           # investigate findings: {reproduced, observed_error, evidence}
+    execution_log: list           # every sandbox command executed (initial + retry probes), in order
+    retry_findings: str           # retry-probe transcript, fed into the next write_patch prompt
     started: float
     solution: Optional[Solution]

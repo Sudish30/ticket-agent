@@ -325,6 +325,12 @@ def assemble_pr(state: OrchestratorState) -> OrchestratorState:
                     new_tests.append(str(t))
     reports = [SubtaskReport(**s.model_dump(include={"id", "worker", "instruction", "status",
                                                      "attempts", "summary"})) for s in subtasks]
+    investigation = []
+    for s in subtasks:                                         # surface the solver's live investigation per fix
+        if s.worker == "code_writer":
+            inv = (state["results"].get(s.id) or {}).get("investigation")
+            if isinstance(inv, dict) and (inv.get("commands") or inv.get("evidence")):
+                investigation.append({"subtask": s.id, **inv})
     try:
         data = _call(prompts.PR_PACKAGE.format(
             brief=state["brief"].model_dump_json(indent=2),
@@ -345,6 +351,7 @@ def assemble_pr(state: OrchestratorState) -> OrchestratorState:
         tests_passed=tests_passed,
         tests_failed=tests_failed,
         new_tests_added=new_tests,
+        investigation=investigation,
         pr_title=title or f"{state['brief'].ticket_id}: {state['brief'].goal[:80]}",
         pr_description=description,
         duration_seconds=round(time.time() - state.get("started", time.time()), 1),
@@ -418,8 +425,10 @@ def finalize(state: OrchestratorState) -> OrchestratorState:
         crs = [ChangeRequest(issue="the reviewer returned no checks and no change requests",
                              suggestion="review this PR manually", severity="blocker")]
     blockers = [c for c in crs if c.severity == "blocker"]
+    probe_log = [c for c in (raw.get("probe_log") or []) if isinstance(c, dict)]
     review = Review(verdict="request_changes" if blockers else "approve",
-                    checks=checks, change_requests=crs, rounds=state.get("review_rounds", 1))
+                    checks=checks, change_requests=crs, rounds=state.get("review_rounds", 1),
+                    probe_log=probe_log)
     status = pr.status
     if blockers and status != "failed":          # a blocked review outranks complete/partial — never silently approve
         status = "needs_human_review"

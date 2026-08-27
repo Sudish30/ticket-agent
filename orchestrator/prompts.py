@@ -86,6 +86,10 @@ Rules:
   one pytest process: an earlier test may already have consumed the exact resource your test would recreate
   (e.g. an identical token issued in the same clock second). Make every test self-contained — create your own
   users/tokens/records instead of reusing ones other tests already touched.
+- For any time-boundary assertion, freeze the clock with monkeypatch — never offset the real clock. Patch
+  time.time to a fixed t0 for setup and to exactly t0 + offset for the check: offsets added to the REAL clock
+  (`lambda: time.time() + 1799`) let test overhead and int() truncation drift the computed age across the
+  boundary, making the test flaky.
 - To modify an existing test file: old_str must be copied EXACTLY (whitespace included) and occur exactly once in it.
 - To create a NEW test file: use old_str "" and put the complete file content in new_str.
 - List every test you add in new_tests as "tests/test_file.py::test_name".
@@ -126,6 +130,10 @@ Combined diff:
 Full post-change content of every changed file:
 {files}
 
+Empirical probes you ran in a scratch copy of the workspace (commands + results; the scratch copy was
+discarded — probe files never enter the diff), ending with the deterministic discrimination check:
+{probes}
+
 Run exactly these checks, in this order, one entry each in "checks":
 1. "acceptance_criteria" — EVERY acceptance criterion is addressed: quote each AC and point at the diff line(s)
    or the new test that satisfies it. Any AC not addressed → result "fail".
@@ -135,7 +143,8 @@ Run exactly these checks, in this order, one entry each in "checks":
    broken auth, resource leaks, behavior changes beyond the brief).
 5. "tests_assert_acs" — the new tests genuinely assert the acceptance criteria (real setup, meaningful
    assertions on the behavior each AC describes), not trivially passing: no assert True, no tautologies,
-   no tests that would pass even without the fix.
+   no tests that would pass even without the fix. Weigh the discrimination check above: new tests that FAIL
+   with the fix reverted are empirically proven to discriminate; new tests that still pass prove nothing.
 
 Verdict rules:
 - Any "fail" check → verdict "request_changes" with at least one change request explaining it.
@@ -209,4 +218,34 @@ Rules:
 - Be honest: name anything that failed, was skipped, or could not be verified, and any pre-existing failures
   deliberately left alone as out of scope.
 Return JSON: {{"pr_title": "...", "pr_description": "..."}}
+Output only JSON, no prose, no markdown fences."""
+
+REVIEW_PROBE = """You are the review gate for this change. Before rendering your verdict you may RUN commands
+in a scratch copy of the patched workspace (cwd = repo root; it is discarded afterwards — nothing you do here
+enters the diff).
+
+Task Brief (JSON):
+{brief}
+
+Final test results: {tests}
+
+Combined diff under review:
+{diff}
+
+Probes already run (and results):
+{transcript}
+
+You have {remaining} probe command(s) left. A deterministic revert-check of the new tests runs automatically
+after your probes — do NOT spend commands reverting the fix yourself.
+
+Rules:
+- Useful probes: run the suite yourself (`python -m pytest -q`), run one suspect test, execute a snippet that
+  probes an edge the diff might miss, or write your OWN probe test file and run it (e.g. write probe_test.py
+  via a heredoc, then `python -m pytest -q probe_test.py`).
+- Relative paths only; no `..`, no absolute paths, no `/dev/null`, no network. `python` / `pytest` are
+  available on PATH.
+- One command per reply. Reply {{"action": "done"}} when you have what you need — never spend commands for
+  the sake of it.
+
+Reply with ONE JSON object: {{"action": "run", "cmd": "...", "reason": "..."}} or {{"action": "done"}}.
 Output only JSON, no prose, no markdown fences."""

@@ -53,6 +53,7 @@ class Review(BaseModel):
     checks: list[ReviewCheck] = []
     change_requests: list[ChangeRequest] = []
     rounds: int = 1
+    probe_log: list[dict] = []   # sandbox commands the reviewer ran in its scratch copy (incl. the revert-check)
 
 
 class PRPackage(BaseModel):
@@ -74,6 +75,7 @@ class PRPackage(BaseModel):
     pr_title: str = ""
     pr_description: str = ""
     review: Optional[Review] = None
+    investigation: list[dict] = []   # per code_writer subtask: {subtask, reproduced, observed_error, evidence, commands}
     duration_seconds: float = 0.0
 
     def to_markdown(self) -> str:
@@ -105,6 +107,29 @@ class PRPackage(BaseModel):
             if minors:
                 out += ["", "### Follow-ups (minor)",
                         *[f"- `{c.file or '—'}`: {c.issue} — _{c.suggestion}_" for c in minors]]
+            if self.review.probe_log:
+                out += ["", f"<details><summary>Reviewer probes ({len(self.review.probe_log)} command(s))</summary>",
+                        "", "```"]
+                for r in self.review.probe_log:
+                    out.append(f"$ {r.get('cmd')}  -> exit {r.get('exit_code')}")
+                    tail = str(r.get("stdout") or r.get("stderr") or "").strip().splitlines()
+                    out += [f"    {ln}" for ln in tail[-3:]]
+                out += ["```", "", "</details>"]
+        if self.investigation:
+            out += ["", "## Investigation"]
+            for inv in self.investigation:
+                cmds = inv.get("commands") or []
+                out += ["", f"**{inv.get('subtask', '?')}** — reproduced: {inv.get('reproduced', 'no')} · "
+                            f"{inv.get('evidence', '') or '(no findings)'}"]
+                if inv.get("observed_error"):
+                    out.append(f"Observed: {str(inv['observed_error'])[:300]}")
+                if cmds:
+                    out += ["", f"<details><summary>Command log ({len(cmds)} command(s))</summary>", "", "```"]
+                    for r in cmds:
+                        out.append(f"[{r.get('phase', '')}] $ {r.get('cmd')}  -> exit {r.get('exit_code')}")
+                        tail = str(r.get("stdout") or r.get("stderr") or "").strip().splitlines()
+                        out += [f"    {ln}" for ln in tail[-3:]]
+                    out += ["```", "", "</details>"]
         out += [
             "",
             "## Subtasks",

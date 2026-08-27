@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from orchestrator import run as run_orchestrator
+from quorum_backend.github_pr import open_pr_from_package
 from ticket_agent import run
 from ticket_agent.channels import JiraCommentChannel
 from ticket_agent.jira_client import FakeJiraClient
@@ -95,7 +96,7 @@ def create_ticket(t: NewTicket):
             "assignee": "", "labels": [], "components": [], "linked_issues": [], "epic": "",
             "status": "Clarifying", "created": datetime.now().isoformat(timespec="seconds"),
             "comments": [], "brief": None, "brief_md": "", "error": "",
-            "pr_package": None, "pr_package_md": "",
+            "pr_package": None, "pr_package_md": "", "pr_url": "",
         }
         _save(d)
     # The intake agent starts automatically on creation; /solve stays as a manual retry after "Agent error".
@@ -177,6 +178,49 @@ def solve_brief(key: str):
     _update(key, status="Solving", error="")
     threading.Thread(target=_run_orchestrator, args=(key,), daemon=True).start()
     return {"ok": True, "status": "Solving"}
+
+
+# ---------------- GitHub PR opener ----------------
+
+def _repo_entry() -> dict | None:
+    """The repos.json entry matching the repo the orchestrator ran against (REPO)."""
+    f = _HOME / "repos.json"
+    if not f.is_file():
+        return None
+    for entry in json.loads(f.read_text()).values():
+        if (_HOME / entry.get("path", "")).resolve() == Path(REPO).resolve():
+            return entry
+    return None
+
+def _open_pr(key: str, prev_status: str) -> None:
+    try:
+        t = _get(key)
+        entry = _repo_entry()
+        if not entry or not entry.get("github"):
+            raise ValueError(f"no GitHub remote configured for {REPO} in repos.json")
+        url = open_pr_from_package(t["pr_package"], entry["github"], key)
+        _update(key, status="PR opened", pr_url=url, error="")
+        FakeJiraClient(base_url="http://127.0.0.1:8000").add_comment(key, f"Opened PR: {url}", author=AGENT_NAME)
+    except Exception as e:  # surface failures in the UI; status reverts so the button can retry
+        traceback.print_exc()
+        _update(key, status=prev_status, error=f"{type(e).__name__}: {e}")
+
+@app.post("/api/tickets/{key}/open-pr")
+def open_pr(key: str):
+    """Engineer's "Open PR on GitHub": applies the stored package diff to a fresh clone of the
+    ticket repo's GitHub remote, pushes branch agent/<key>-<slug>, opens the PR with gh, then
+    stores the URL on the ticket, posts it as a comment, and sets status "PR opened"."""
+    t = _get(key)
+    if not t.get("pr_package"):
+        raise HTTPException(409, f"ticket is {t['status']} and has no PR package")
+    if t.get("pr_url"):
+        raise HTTPException(409, f"PR already opened: {t['pr_url']}")
+    if t["status"] == "Opening PR":
+        raise HTTPException(409, "PR is already being opened")
+    prev = t["status"]
+    _update(key, status="Opening PR", error="")
+    threading.Thread(target=_open_pr, args=(key, prev), daemon=True).start()
+    return {"ok": True, "status": "Opening PR"}
 
 
 # ---------------- serve the Quorum UI ----------------

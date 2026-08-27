@@ -1,9 +1,9 @@
 """The Solver Agent graph: TaskBrief in, Solution out.
 
-    load_brief ─► read_files ─► plan_fix ─► write_patch ─► apply_patch ─► run_tests ─► emit_solution ─► END
-                                                ▲                                │ (retry: new failures, patch
-                                                └────────────────────────────────┘  errors, or in-scope failures
-                                                                                    remain; max 3 attempts)
+    load_brief ─► read_files ─► investigate ─► plan_fix ─► write_patch ─► apply_patch ─► run_tests ─► END
+                                     ▲   (≤6 cmds)                ▲                          │ (via emit_solution)
+                                     └────────────────────────────┴──────────────────────────┘ (retry: re-enters
+                              investigate in retry mode, ≤2 diagnostic commands, then write_patch; max 3 attempts)
 
 Verification is judged against a baseline pytest run on the pristine repo (done once, in read_files, so plan_fix
 can classify each pre-existing failure as in scope or out of scope for the brief). Three outcomes:
@@ -36,6 +36,7 @@ from pydantic import ValidationError
 
 from ticket_agent.codebase import Codebase
 from ticket_agent.llm import call_json, make_llm
+from ticket_agent.sandbox import SandboxError, run_cmd
 from ticket_agent.schemas import TaskBrief
 
 from . import prompts
@@ -43,6 +44,8 @@ from .schemas import Edit, Solution, SolverState
 
 MAX_CONTEXT_FILES = 15
 TEST_TIMEOUT = 120
+MAX_INVESTIGATE_CMDS = 6     # initial investigation: commands allowed to reproduce/localize the bug
+MAX_RETRY_PROBE_CMDS = 2     # extra diagnostic commands allowed before each retry patch
 COPY_IGNORE = (".git", "__pycache__", ".venv", "venv", ".pytest_cache", "node_modules", "*.pyc")
 
 
@@ -166,6 +169,87 @@ def read_files(state: SolverState) -> SolverState:
             "baseline_failed": baseline_failed, "baseline_counts": baseline_counts}
 
 
+def _cmd_line(r: dict) -> str:
+    tail = (r.get("stdout", "") + ("\n" + r.get("stderr", "") if str(r.get("stderr", "")).strip() else "")).strip()
+    tail = "\n".join(tail.splitlines()[-12:])
+    return f"$ {r.get('cmd')}\n[exit {r.get('exit_code')}, {r.get('duration', 0)}s]\n{tail}"
+
+
+def _transcript_text(entries: list[dict]) -> str:
+    return "\n\n".join(_cmd_line(r) for r in entries) or "(none yet)"
+
+
+def investigate(state: SolverState) -> SolverState:
+    """Run commands in a scratch copy of the repo to reproduce/localize the bug (initial: ≤6 commands) or to
+    diagnose a failed attempt before re-patching (retry: ≤2). Executed commands land in execution_log; the
+    structured findings ground plan_fix (initial) or ride into the retry patch prompt (retry_findings)."""
+    log = list(state.get("execution_log") or [])
+    retry = bool(state.get("attempts"))
+    limit = MAX_RETRY_PROBE_CMDS if retry else MAX_INVESTIGATE_CMDS
+    phase = f"retry-{state.get('attempts')}" if retry else "initial"
+    scratch_root = tempfile.mkdtemp(prefix="solver-probe-")
+    scratch = os.path.join(scratch_root, "repo")
+    _copy_repo(state["src"], scratch)
+    transcript: list[dict] = []
+    findings = None
+    try:
+        for _ in range(limit):
+            if retry:
+                prev = (state.get("history") or [{}])[-1]
+                prompt = prompts.INVESTIGATE_RETRY.format(
+                    remaining=limit - len(transcript),
+                    previous_edits=json.dumps(prev.get("edits") or [], indent=2),
+                    result=str(prev.get("result", ""))[:3000],
+                    transcript=_transcript_text(transcript))
+            else:
+                prompt = prompts.INVESTIGATE.format(
+                    brief=state["brief"].model_dump_json(indent=2),
+                    files=_files_block(state["files"]),
+                    baseline="\n".join(f"- {t}" for t in (state.get("baseline_failed") or [])) or "(none)",
+                    transcript=_transcript_text(transcript),
+                    remaining=limit - len(transcript))
+            data = _call(prompt)
+            if str(data.get("action")) != "run" or not str(data.get("cmd") or "").strip():
+                f = data.get("findings")
+                findings = f if isinstance(f, dict) else {}
+                break
+            cmd = str(data["cmd"])
+            try:
+                res = run_cmd(scratch, cmd, log=log)
+            except SandboxError as e:                      # refused = never executed; not logged, but fed back
+                res = {"cmd": cmd, "stdout": "", "stderr": f"sandbox refused: {e}",
+                       "exit_code": -1, "duration": 0.0}
+            res["phase"] = phase
+            res["reason"] = str(data.get("reason", ""))
+            transcript.append(res)
+        if findings is None and not retry:                 # budget exhausted without "done": force the summary
+            data = _call(prompts.INVESTIGATE_WRAPUP.format(transcript=_transcript_text(transcript)))
+            f = data.get("findings")
+            findings = f if isinstance(f, dict) else {}
+    finally:
+        shutil.rmtree(scratch_root, ignore_errors=True)
+    findings = findings or {}
+    findings = {"reproduced": str(findings.get("reproduced", "no")).lower(),
+                "observed_error": str(findings.get("observed_error", "")),
+                "evidence": str(findings.get("evidence", ""))}
+    if retry:
+        text = _transcript_text(transcript)
+        if findings["evidence"]:
+            text += f"\nConclusion: {findings['evidence']}"
+        return {"execution_log": log, "retry_findings": text}
+    return {"execution_log": log, "investigation": findings}
+
+
+def _investigation_text(state: SolverState) -> str:
+    inv = state.get("investigation") or {}
+    cmds = [r for r in (state.get("execution_log") or []) if r.get("phase") == "initial"]
+    if not inv and not cmds:
+        return "(no investigation was run)"
+    head = (f"reproduced: {inv.get('reproduced', 'no')} · observed: {inv.get('observed_error') or '(none)'}\n"
+            f"evidence: {inv.get('evidence') or '(none)'}")
+    return head + ("\n\nCommands run:\n" + _transcript_text(cmds) if cmds else "")
+
+
 def plan_fix(state: SolverState) -> SolverState:
     baseline = state.get("baseline_failed") or []
     ti = state.get("task_instruction") or ""
@@ -174,6 +258,7 @@ def plan_fix(state: SolverState) -> SolverState:
         instruction=prompts.TASK_INSTRUCTION_NOTE.format(instruction=ti) if ti else "",
         files=_files_block(state["files"]),
         baseline="\n".join(f"- {t}" for t in baseline) or "(none — the suite is green before any patch)",
+        investigation=_investigation_text(state),
     ))
     changes = data.get("changes")
     if not isinstance(changes, list) or not changes:
@@ -192,7 +277,8 @@ def write_patch(state: SolverState) -> SolverState:
         prev = history[-1]
         retry_note = prompts.RETRY_NOTE.format(attempt=attempt,
                                                previous_edits=json.dumps(prev["edits"], indent=2),
-                                               result=prev["result"])
+                                               result=prev["result"],
+                                               probe=state.get("retry_findings") or "(none run)")
     data = _call(prompts.WRITE_PATCH.format(
         plan=json.dumps(state["plan"], indent=2),
         guard=json.dumps({"constraints": brief.constraints, "out_of_scope": brief.out_of_scope,
@@ -397,6 +483,8 @@ def emit_solution(state: SolverState) -> SolverState:
         tests_failed=state.get("tests_failed", 0),
         test_output_tail="\n".join(state.get("test_output", "").splitlines()[-30:]),
         rationale=" ".join(b for b in bits if b).strip(),
+        investigation=({**(state.get("investigation") or {}), "commands": list(state.get("execution_log") or [])}
+                       if (state.get("investigation") or state.get("execution_log")) else {}),
         duration_seconds=round(time.time() - state.get("started", time.time()), 1),
     )
     return {"solution": solution}
@@ -409,23 +497,29 @@ def after_run_tests(state: SolverState) -> str:
         return "emit_solution"
     if state.get("attempts", 0) >= state.get("max_attempts", 3):
         return "emit_solution"
-    return "write_patch"
+    return "investigate"                                       # retry re-enters via ≤2 diagnostic commands
+
+
+def after_investigate(state: SolverState) -> str:
+    return "write_patch" if state.get("attempts") else "plan_fix"
 
 
 def build_graph():
     g = StateGraph(SolverState)
-    for name, fn in [("load_brief", load_brief), ("read_files", read_files), ("plan_fix", plan_fix),
-                     ("write_patch", write_patch), ("apply_patch", apply_patch), ("run_tests", run_tests),
-                     ("emit_solution", emit_solution)]:
+    for name, fn in [("load_brief", load_brief), ("read_files", read_files), ("investigate", investigate),
+                     ("plan_fix", plan_fix), ("write_patch", write_patch), ("apply_patch", apply_patch),
+                     ("run_tests", run_tests), ("emit_solution", emit_solution)]:
         g.add_node(name, fn)
     g.set_entry_point("load_brief")
     g.add_edge("load_brief", "read_files")
-    g.add_edge("read_files", "plan_fix")
+    g.add_edge("read_files", "investigate")
+    g.add_conditional_edges("investigate", after_investigate,
+                            {"plan_fix": "plan_fix", "write_patch": "write_patch"})
     g.add_edge("plan_fix", "write_patch")
     g.add_edge("write_patch", "apply_patch")
     g.add_edge("apply_patch", "run_tests")
     g.add_conditional_edges("run_tests", after_run_tests,
-                            {"write_patch": "write_patch", "emit_solution": "emit_solution"})
+                            {"investigate": "investigate", "emit_solution": "emit_solution"})
     g.add_edge("emit_solution", END)
     return g.compile()
 

@@ -120,7 +120,10 @@ open http://localhost:8000
 ## Solver agent (stage 2)
 
 `python -m solver_agent.main brief.json --repo demo_repo` takes the confirmed brief, reads the suspected files (plus
-any files the brief's `affected_areas`/`evidence` prose names, plus their local imports), plans and writes exact
+any files the brief's `affected_areas`/`evidence` prose names, plus their local imports), **investigates live** —
+up to 6 sandboxed shell commands in a scratch copy (running the failing test, executing snippets, printing values)
+to reproduce and localize the bug before planning, with the findings grounding the diagnosis (retries get 2 more
+diagnostic commands to test why the failure happened) — then plans and writes exact
 `old_str → new_str` edits, applies them to a fresh temp copy of the repo, and runs pytest — up to 3 attempts, feeding
 failures back into the retry. Verification is judged against a baseline run and has three outcomes: **passed** (fixed a
 previously-failing test, or a newly-added regression test passes — always with zero new failures), **applied_unverified**
@@ -137,7 +140,10 @@ pytest tests for the acceptance criteria against the patched code), and `docs_wr
 the fix made stale and appends a CHANGELOG note — a guard rejects any edit touching executable code). Results are evaluated status-aware: a `passed`
 fix is accepted, an `applied_unverified` fix is never retried but gets a regression-test subtask appended to verify
 it, and a `failed` one is retried with feedback (max 2), then replanned (max 1), then reported honestly. The run
-run always ends at the **review gate**: an independent reviewer judges the brief + diff + full changed files +
+run always ends at the **review gate**: an independent reviewer first probes the change empirically — up to 5
+sandboxed commands in a scratch copy of the workspace (running the suite itself, writing and running its own probe
+tests, and a deterministic discrimination check that reverts the fix and confirms the new tests then fail —
+"empirically verified" vs "reasoned" in the review notes) — then judges the brief + diff + full changed files +
 tests (never the workers' reasoning) against five checks — every acceptance criterion addressed, constraints
 respected, out_of_scope untouched, no regressions/security issues, and new tests genuinely asserting the ACs.
 Blocking change requests get ONE repair round (a scoped subtask, then one re-review); a still-blocked run ships as
@@ -151,7 +157,10 @@ ticket's Clarification thread → reply as the reporter → the agent posts its 
 **Brief ready** → the Engineer clicks **Start solving** (`POST /solve-brief`), which runs the orchestrator on the
 stored brief (status **Solving**) → status **PR ready** (or **Needs human review** per the package status), the PR
 markdown is posted as a comment, and the Solutions screen shows the package: subtask table, review table, and the
-combined diff in a collapsible block.
+combined diff in a collapsible block → the Engineer clicks **Open PR on GitHub** (`POST /open-pr`), which applies the
+stored diff to a fresh clone of the repo's GitHub remote (`repos.json` maps Notely's `demo_repo` to
+`Sudish30/notely-demo`), pushes branch `agent/<key>-<slug>`, opens a real PR with `gh`, posts the URL as a comment,
+and turns the button into a link (status **PR opened**).
 
 The topbar **View as** toggle (remembered in `localStorage` as `quorum-role`, default Reporter) picks the lens:
 - **Reporter** — ticket details, the Clarification thread and the reply box. No solving controls, no brief, no Solutions tab.

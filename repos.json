@@ -1,0 +1,8 @@
+{
+  "notely": {
+    "path": "demo_repo",
+    "github": "Sudish30/notely-demo",
+    "default_branch": "main",
+    "description": "Notely demo Flask app (planted bugs NOTE-142 / NOTE-151 / NOTE-157)"
+  }
+}

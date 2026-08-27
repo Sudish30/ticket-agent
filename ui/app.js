@@ -120,7 +120,7 @@ function fromBackend(t) {
     id: t.key, title: t.summary, description: t.description, reporter: t.reporter,
     createdAt: t.created, repository: t.repository || "", status: t.status,
     comments: t.comments || [], brief: t.brief || null, briefMd: t.brief_md || "", error: t.error || "",
-    prPackage: t.pr_package || null, prPackageMd: t.pr_package_md || "",
+    prPackage: t.pr_package || null, prPackageMd: t.pr_package_md || "", prUrl: t.pr_url || "",
     solutions: local?.solutions || [], resolution: local?.resolution || null
   };
 }
@@ -140,7 +140,7 @@ function startPolling() {
   stopPolling();
   pollTimer = window.setInterval(async () => {
     if (state.currentScreen !== "tickets" && state.currentScreen !== "solutions") return;
-    const sig = (ts) => JSON.stringify(ts.map((t) => [t.id, t.status, t.comments?.length, Boolean(t.prPackage)]));
+    const sig = (ts) => JSON.stringify(ts.map((t) => [t.id, t.status, t.comments?.length, Boolean(t.prPackage), t.prUrl]));
     const before = sig(state.tickets);
     await syncTickets();
     const after = sig(state.tickets);
@@ -203,6 +203,8 @@ function ticketStatus(ticket) {
   if (ticket.status === "Brief ready" && !ticket.solutions.length) return { label: "Brief ready", tone: "warning" };
   if (ticket.status === "Solving") return { label: "Solving", tone: "active" };
   if (ticket.status === "PR ready") return { label: "PR ready", tone: "success" };
+  if (ticket.status === "Opening PR") return { label: "Opening PR", tone: "active" };
+  if (ticket.status === "PR opened") return { label: "PR opened", tone: "success" };
   if (ticket.status === "Needs human review") return { label: "Needs human review", tone: "warning" };
   if (ticket.solutions.length) return { label: "Needs decision", tone: "warning" };
   return { label: "Queued", tone: "" };   // legacy "Ready" tickets from before the agent auto-started
@@ -313,6 +315,12 @@ function prPackageBlock(ticket) {
         <td>${statusBadge(s.status, s.status === "accepted" ? "success" : s.status === "skipped" ? "warning" : "error")}</td>
         <td>${Number(s.attempts) || 0}</td><td>${escapeHtml(s.summary || "")}</td></tr>`).join("");
   const newTests = (p.new_tests_added || []).map((t) => `<li><code>${escapeHtml(t)}</code></li>`).join("");
+  // "Open PR on GitHub" (POST /open-pr) until a PR exists; then a link to it. Errors from a failed
+  // attempt ride on ticket.error and the status reverts, so the button comes back for a retry.
+  const openingPr = ticket.status === "Opening PR";
+  const prAction = ticket.prUrl
+    ? `<p><a class="btn btn--primary" href="${escapeHtml(ticket.prUrl)}" target="_blank" rel="noopener">View PR on GitHub ↗</a></p>`
+    : `<p><button class="btn btn--primary" type="button" data-open-pr="${escapeHtml(ticket.id)}" ${openingPr ? 'disabled data-state="loading"' : ""}>${openingPr ? "Opening PR…" : "Open PR on GitHub"}</button>${ticket.error ? ` <span class="muted">${escapeHtml(ticket.error)}</span>` : ""}</p>`;
   return `
       <section class="ticket-thread" aria-label="PR package">
         <header class="solution-ticket-context__head">
@@ -320,6 +328,7 @@ function prPackageBlock(ticket) {
           ${statusBadge(p.status.replaceAll("_", " "), tone)}
         </header>
         <p class="muted">${Number(p.tests_passed) || 0} passed · ${Number(p.tests_failed) || 0} failed · ${(p.new_tests_added || []).length} new test(s) · ${Math.round(p.duration_seconds || 0)}s</p>
+        ${prAction}
         <details class="ticket-brief" open><summary><strong>PR description</strong></summary>
           <pre class="thread-body">${escapeHtml(p.pr_description || "")}</pre></details>
         <strong>Subtasks</strong>
@@ -850,6 +859,18 @@ function bindSolutions() {
     button.dataset.state = "loading";
     button.textContent = "Starting orchestrator…";
     try { await api(`/api/tickets/${ticket.id}/solve-brief`, {}); } catch (err) { alert(err.message); }
+    await syncTickets();
+    renderScreen("solutions", { focus: false, updateHash: false });
+  });
+
+  // Engineer: "Open PR on GitHub" applies the stored package diff to a clone of the ticket repo's
+  // GitHub remote and opens a real PR (POST /open-pr). Polling picks up "PR opened" + the URL.
+  document.querySelector("[data-open-pr]")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.dataset.state = "loading";
+    button.textContent = "Opening PR…";
+    try { await api(`/api/tickets/${ticket.id}/open-pr`, {}); } catch (err) { alert(err.message); }
     await syncTickets();
     renderScreen("solutions", { focus: false, updateHash: false });
   });
