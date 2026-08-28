@@ -88,7 +88,8 @@ lookup_codebase ──► analyze ──► (all clear) ──► build_brief �
   `INTEGRATION.md` documents the 4 REST routes a custom ticket UI must implement.
 
 `TaskBrief` fields: `problem_statement, goal, acceptance_criteria, repro_steps, affected_areas, constraints,
-out_of_scope, resolved_questions, assumptions, evidence, suspected_files, related_findings, confidence`.
+out_of_scope, resolved_questions, assumptions, evidence, suspected_files, related_findings, confidence` — plus
+three metadata fields filled in code rather than by the model: `ticket_id`, `ticket_type`, `clarification_contact`.
 
 Knobs: `--max-rounds` (default 3, i.e. ≤2 clarification rounds + sign-off), `--contact` (who gets asked),
 `--out` (brief.json; a Markdown twin brief.md is always written), `--post-brief` (post the brief on the ticket),
@@ -169,7 +170,13 @@ the ticket and posted as a comment. Requires the `gh` CLI authenticated with pus
 
 `mock_tickets/FIN-203.json` targets **FinPilot** (`Sudish30/Finpilot`), a larger FastAPI app: a duplicate-charge
 detector whose key lost its date component, so every monthly subscription flags as a duplicate. Its backend has no
-test suite — which exercises the `applied_unverified` → regression-test-verification path end to end.
+test suite — which exercises the `applied_unverified` → regression-test-verification path end to end. The FinPilot
+demo expects a machine-local scratch clone at the path `repos.json` names (`/tmp/finpilot-test/Finpilot/backend`):
+
+```bash
+git clone https://github.com/Sudish30/Finpilot.git /tmp/finpilot-test/Finpilot   # or edit repos.json's "path"
+# plant the FIN-203 bug: in backend/app/services/analytics.py, delete ", t.date" from the dedup key
+```
 `mock_tickets/PROJ-142.json` is a standalone ticket with no codebase.
 
 ## Layout
@@ -184,7 +191,7 @@ test suite — which exercises the `applied_unverified` → regression-test-veri
 | `quorum_backend/` | FastAPI backend: ticket store, agent runners, `/solve-brief`, `/open-pr`, serves the UI |
 | `quorum_backend/github_pr.py` | clone → branch → apply diff → commit → push → `gh pr create` |
 | `ui/` | bundled backend-wired Quorum UI (index.html, app.js, styles.css, tokens.css) |
-| `repos.json` | project name → `{path, github, default_branch}` mapping for open-pr |
+| `repos.json` | project name → `{path, github, default_branch, description}` mapping for open-pr |
 | `demo_repo/` | Notely, the planted-bug demo app |
 | `mock_tickets/` | `Ticket`-shaped JSON fixtures (PROJ-142, NOTE-142/151/157, FIN-203) |
 | `main.py` | stage-1 CLI (`--repo`, `--jira`, `--post-brief`, …) |
@@ -196,7 +203,9 @@ test suite — which exercises the `applied_unverified` → regression-test-veri
 `ANTHROPIC_API_KEY` (required) · `TICKET_AGENT_MODEL` (default `claude-sonnet-4-6`) · `TICKET_AGENT_REPO`
 (default repo for grounding/solving) · `GITHUB_TOKEN` (optional, for GitHub-hosted `--repo`) · `QUORUM_UI_DIR`
 (UI dir to serve; default the bundled `ui/`) · `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` /
-`JIRA_AGENT_NAME` (only for `--jira`). The web backend must run on port 8000 (the agent calls itself over HTTP).
+(only for `--jira`) · `JIRA_AGENT_NAME` (the agent's display name — used by `--jira` AND by the web backend to
+author its ticket comments; default "Ticket Agent"). The web backend must run on port 8000 (the agent calls
+itself over HTTP).
 
 ## Next steps (if time)
 
