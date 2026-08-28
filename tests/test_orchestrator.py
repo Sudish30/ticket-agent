@@ -343,6 +343,7 @@ class ReviewerProbe(OrchestratorBase):
             res = real_reviewer(ctx)
         self.assertEqual(len(res["probe_log"]), 1)                     # just the deterministic revert-check
         self.assertIn("pytest", res["probe_log"][0]["cmd"])
+        self.assertIn("[REVERT-CHECK", res["probe_log"][0]["cmd"])     # tagged so it can't be misread as with-fix
         self.assertNotEqual(res["probe_log"][0]["exit_code"], 0)       # the new test FAILS on reverted code
         note = next(c["note"] for c in res["checks"] if c["name"] == "tests_assert_acs")
         self.assertIn("empirically verified", note)

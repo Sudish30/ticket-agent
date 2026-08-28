@@ -103,6 +103,9 @@ def _discrimination(ctx: dict, scratch: str, log: list) -> str:
         res = run_cmd(scratch, "python -m pytest -q " + " ".join(new_tests), timeout=120, log=log)
     except SandboxError as e:
         return f"reasoned (revert-check refused: {e})"
+    # Tag the logged entry so neither the REVIEW prompt transcript nor the stored probe_log can mistake
+    # this reverted-code run for a with-fix probe: a failure HERE is the desired outcome.
+    res["cmd"] = "[REVERT-CHECK — failure here means the test discriminates, which is GOOD] " + res["cmd"]
     if res["exit_code"] != 0:
         return (f"empirically verified: with the fix reverted ({', '.join(reverted)}) "
                 "the new tests FAIL — they genuinely discriminate")

@@ -131,7 +131,9 @@ Full post-change content of every changed file:
 {files}
 
 Empirical probes you ran in a scratch copy of the workspace (commands + results; the scratch copy was
-discarded — probe files never enter the diff), ending with the deterministic discrimination check:
+discarded — probe files never enter the diff), ending with the deterministic discrimination check. The probe
+tagged [REVERT-CHECK] ran on the scratch copy WITH THE FIX REVERTED: a test failure during the revert-check is
+expected and proves discrimination — it is not a with-fix failure. Only untagged probes reflect the fixed code.
 {probes}
 
 Run exactly these checks, in this order, one entry each in "checks":
