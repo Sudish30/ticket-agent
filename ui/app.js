@@ -9,6 +9,10 @@ const ROLE_KEY = "quorum-role";                       // "reporter" (default) | 
 const ROLES = { reporter: "Reporter", engineer: "Engineer" };
 
 const screens = {
+  projects: {
+    title: "Projects",
+    description: "Every repository Quorum works on. Open a project to see its tickets and solutions."
+  },
   tickets: {
     title: "Tickets",
     description: "Incoming work appears here. Open a ticket to read its description, reporter, status, and attempted solutions."
@@ -56,9 +60,11 @@ const deliveryOptions = {
 };
 
 const state = {
-  currentScreen: "tickets",
+  currentScreen: "projects",
+  currentProject: null,                               // repos.json project name; null = the dashboard
   role: "reporter",
   tickets: [],
+  repos: [],                                          // /api/repos entries with per-status ticket counts
   selectedTicketId: null,
   expandedTicketId: null,
   selectedSolutionId: null,
@@ -127,8 +133,9 @@ function fromBackend(t) {
 
 async function syncTickets() {
   try {
-    const list = await api("/api/tickets");
+    const [list, repos] = await Promise.all([api("/api/tickets"), api("/api/repos")]);
     state.tickets = list.map(fromBackend);
+    state.repos = repos;
     persistState();
   } catch (err) {
     console.warn("backend unreachable", err);
@@ -139,7 +146,7 @@ let pollTimer = null;
 function startPolling() {
   stopPolling();
   pollTimer = window.setInterval(async () => {
-    if (state.currentScreen !== "tickets" && state.currentScreen !== "solutions") return;
+    if (!["projects", "tickets", "solutions"].includes(state.currentScreen)) return;
     const sig = (ts) => JSON.stringify(ts.map((t) => [t.id, t.status, t.comments?.length, Boolean(t.prPackage), t.prUrl]));
     const before = sig(state.tickets);
     await syncTickets();
@@ -168,6 +175,7 @@ function restoreState() {
     const saved = JSON.parse(window.localStorage.getItem(STORAGE_KEY));
     if (!saved || !Array.isArray(saved.tickets)) return;
     state.tickets = saved.tickets;
+    state.currentProject = saved.currentProject || null;
     state.selectedTicketId = saved.selectedTicketId || null;
     state.expandedTicketId = saved.expandedTicketId || null;
     state.selectedSolutionId = saved.selectedSolutionId || null;
@@ -180,6 +188,7 @@ function restoreState() {
 function persistState() {
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
     tickets: state.tickets,
+    currentProject: state.currentProject,
     selectedTicketId: state.selectedTicketId,
     expandedTicketId: state.expandedTicketId,
     selectedSolutionId: state.selectedSolutionId,
@@ -194,6 +203,32 @@ function statusBadge(label, tone = "") {
 
 function selectedTicket() {
   return state.tickets.find((ticket) => ticket.id === state.selectedTicketId) || null;
+}
+
+// ---- Projects: repos.json entries (plus orphan repository values) group tickets into workspaces ----
+function visibleTickets() {
+  if (!state.currentProject) return state.tickets;
+  return state.tickets.filter((t) => (t.repository || "") === state.currentProject);
+}
+
+function currentRepo() {
+  return state.repos.find((r) => r.name === state.currentProject) || null;
+}
+
+function hashFor(screen) {
+  if (screen === "projects" || !state.currentProject) return screen;
+  return `project/${encodeURIComponent(state.currentProject)}` + (screen === "tickets" ? "" : `/${screen}`);
+}
+
+// #projects · #project/<name> · #project/<name>/solutions|setup|submission · legacy #tickets → #projects
+function parseRoute(hash) {
+  const route = routeAliases[hash] || hash;
+  if (route.startsWith("project/")) {
+    const [name, sub] = route.slice(8).split("/");
+    return { screen: screens[sub] ? sub : "tickets", project: decodeURIComponent(name || "") || null };
+  }
+  if (route === "tickets" || route === "projects" || route === "") return { screen: "projects", project: null };
+  return { screen: screens[route] ? route : "projects", project: state.currentProject };
 }
 
 function ticketStatus(ticket) {
@@ -214,9 +249,49 @@ function ticketStatusControl(ticket, status) {
   return statusBadge(status.label, status.tone);
 }
 
+function projectCounts(repo) {
+  const n = repo.ticket_count || 0;
+  const parts = [`${n} ${n === 1 ? "ticket" : "tickets"}`];
+  for (const [status, count] of Object.entries(repo.status_counts || {})) parts.push(`${count} ${status}`);
+  return parts.join(" · ");
+}
+
+// The dashboard: one card per project (repos.json entries plus any orphan repository values tickets use).
+function projectsTemplate() {
+  const cards = state.repos.map((repo) => `
+    <button class="project-card" type="button" data-open-project="${escapeHtml(repo.name)}">
+      <strong class="project-card__name">${escapeHtml(repo.name)}</strong>
+      <span class="project-card__desc">${escapeHtml(repo.description || repo.github || "No description.")}</span>
+      <span class="project-card__counts">${escapeHtml(projectCounts(repo))}</span>
+    </button>`).join("");
+  return `
+    <section class="project-grid" aria-label="Projects">
+      ${cards || '<p class="muted">No projects yet — add one to get started.</p>'}
+      <button class="project-card project-card--add" type="button" data-add-project>
+        <strong class="project-card__name">+ Add project</strong>
+        <span class="project-card__desc">Register a repository for Quorum to work on.</span>
+      </button>
+    </section>
+  `;
+}
+
+// Back-to-dashboard header shown at the top of every screen inside a project workspace.
+function projectHeader() {
+  if (!state.currentProject) return "";
+  const repo = currentRepo();
+  return `
+    <div class="project-header">
+      <button class="back-link" type="button" data-screen-link="projects">← Projects</button>
+      <strong>${escapeHtml(state.currentProject)}</strong>
+      ${repo?.description ? `<span class="muted">${escapeHtml(repo.description)}</span>` : ""}
+    </div>`;
+}
+
 function ticketsTemplate() {
-  if (!state.tickets.length) {
+  const tickets = visibleTickets();
+  if (!tickets.length) {
     return `
+      ${projectHeader()}
       <section class="empty-state" aria-labelledby="emptyTicketsHeading">
         <div class="empty-state__copy">
           <h2 id="emptyTicketsHeading">No tickets yet.</h2>
@@ -228,13 +303,14 @@ function ticketsTemplate() {
   }
 
   return `
+    ${projectHeader()}
     <section class="ticket-index" aria-labelledby="ticketIndexHeading">
       <div class="index-heading">
-        <h2 id="ticketIndexHeading">${state.tickets.length} ${state.tickets.length === 1 ? "ticket" : "tickets"}</h2>
+        <h2 id="ticketIndexHeading">${tickets.length} ${tickets.length === 1 ? "ticket" : "tickets"}</h2>
         <p>Newest first</p>
       </div>
       <div class="ticket-list">
-        ${state.tickets.map((ticket) => `${ticketRow(ticket)}${ticketDetail(ticket, state.expandedTicketId === ticket.id)}`).join("")}
+        ${tickets.map((ticket) => `${ticketRow(ticket)}${ticketDetail(ticket, state.expandedTicketId === ticket.id)}`).join("")}
       </div>
     </section>
   `;
@@ -415,7 +491,8 @@ function formatTicketDate(value) {
 }
 
 function solutionTicketPicker(ticket) {
-  const hasTickets = state.tickets.length > 0;
+  const tickets = visibleTickets();
+  const hasTickets = tickets.length > 0;
   const placeholder = hasTickets ? "Select a ticket" : "No tickets available";
 
   return `
@@ -428,7 +505,7 @@ function solutionTicketPicker(ticket) {
         <label class="field-label" for="solutionTicketSelect">Ticket</label>
         <select class="field-select" id="solutionTicketSelect" aria-describedby="solutionTicketSelectHelp" ${hasTickets ? "" : "disabled"}>
           <option value="" ${ticket ? "" : "selected"}>${placeholder}</option>
-          ${state.tickets.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === ticket?.id ? "selected" : ""}>${escapeHtml(item.id)} · ${escapeHtml(item.title)}</option>`).join("")}
+          ${tickets.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === ticket?.id ? "selected" : ""}>${escapeHtml(item.id)} · ${escapeHtml(item.title)}</option>`).join("")}
         </select>
         <span class="field-help" id="solutionTicketSelectHelp">Select a ticket to see its context and attempted solutions.</span>
       </div>
@@ -481,13 +558,14 @@ function solutionsTemplate() {
 
   if (!ticket) {
     return `
+      ${projectHeader()}
       <section class="solutions-selection">
         ${ticketPicker}
         <div class="solution-selection-empty" aria-labelledby="emptySolutionsHeading">
           <div>
             <h3 id="emptySolutionsHeading">No ticket selected.</h3>
-            <p>${state.tickets.length ? "Choose a ticket above to review its details and start solving." : "Create a ticket first, then return here to start solving."}</p>
-            ${state.tickets.length ? "" : '<button class="btn btn--primary" type="button" data-screen-link="submission">Create ticket</button>'}
+            <p>${visibleTickets().length ? "Choose a ticket above to review its details and start solving." : "Create a ticket first, then return here to start solving."}</p>
+            ${visibleTickets().length ? "" : '<button class="btn btn--primary" type="button" data-screen-link="submission">Create ticket</button>'}
           </div>
         </div>
       </section>
@@ -496,6 +574,7 @@ function solutionsTemplate() {
 
   if (ticket.prPackage) {
     return `
+      ${projectHeader()}
       <section class="solutions-workspace">
         ${ticketPicker}
         ${solutionTicketContext(ticket)}
@@ -513,6 +592,7 @@ function solutionsTemplate() {
         ? "The brief is confirmed. Start solving to run the orchestrator (code → tests → docs → review)."
         : "The intake agent has not produced a confirmed brief yet.";
     return `
+      ${projectHeader()}
       <section class="solutions-workspace">
         ${ticketPicker}
         ${solutionTicketContext(ticket)}
@@ -669,7 +749,7 @@ function submissionTemplate() {
         <div class="field">
           <label class="field-label" for="ticketRepository">Repository</label>
           <select class="field-select" id="ticketRepository" name="repository">
-            <option>demo_repo (Notely)</option>
+            ${state.repos.map((r) => `<option value="${escapeHtml(r.name)}" ${r.name === state.currentProject ? "selected" : ""}>${escapeHtml(r.name)}${r.description ? ` — ${escapeHtml(r.description)}` : ""}</option>`).join("") || "<option>demo_repo</option>"}
           </select>
           <span class="field-help">The solver reads this repository when the ticket is started.</span>
         </div>
@@ -706,7 +786,7 @@ function setupTemplate() {
             <span>New tickets start here.</span>
           </div>
           <select class="field-select" id="setupRepository">
-            <option>demo_repo (Notely)</option>
+            ${state.repos.map((r) => `<option value="${escapeHtml(r.name)}" ${r.name === state.currentProject ? "selected" : ""}>${escapeHtml(r.name)}</option>`).join("") || "<option>demo_repo</option>"}
           </select>
         </div>
 
@@ -744,21 +824,26 @@ function setupTemplate() {
 
 function renderScreen(screenName, { focus = true, updateHash = true } = {}) {
   const normalized = routeAliases[screenName] || screenName;
-  const requested = screens[normalized] ? normalized : "tickets";
+  let requested = screens[normalized] ? normalized : "projects";
+  if (requested === "projects") state.currentProject = null;      // the dashboard is outside every project
+  if ((requested === "tickets" || requested === "solutions") && !state.currentProject) requested = "projects";
   const redirected = requested === "solutions" && isReporter();   // reporters have no Solutions screen
   const nextScreen = redirected ? "tickets" : requested;
   state.currentScreen = nextScreen;
 
-  if ((updateHash || redirected) && window.location.hash !== `#${nextScreen}`) {
-    window.history.pushState(null, "", `#${nextScreen}`);
+  const nextHash = `#${hashFor(nextScreen)}`;
+  if ((updateHash || redirected) && window.location.hash !== nextHash) {
+    window.history.pushState(null, "", nextHash);
   }
 
   const meta = screens[nextScreen];
-  screenTitle.textContent = meta.title;
+  screenTitle.textContent = state.currentProject && nextScreen !== "projects"
+    ? `${state.currentProject} · ${meta.title}` : meta.title;
   screenDescription.textContent = meta.description;
   document.title = "Quorum";
 
   const templates = {
+    projects: projectsTemplate,
     tickets: ticketsTemplate,
     solutions: solutionsTemplate,
     submission: submissionTemplate,
@@ -766,6 +851,8 @@ function renderScreen(screenName, { focus = true, updateHash = true } = {}) {
   };
 
   screenRoot.innerHTML = templates[nextScreen]();
+  const tabsNav = document.querySelector(".workspace-tabs");
+  if (tabsNav) tabsNav.hidden = nextScreen === "projects";        // tabs belong to a project workspace
   document.querySelectorAll(".tab-link").forEach((tab) => {
     const current = tab.dataset.screenLink === nextScreen;
     tab.setAttribute("aria-current", current ? "page" : "false");
@@ -777,10 +864,25 @@ function renderScreen(screenName, { focus = true, updateHash = true } = {}) {
 }
 
 function bindScreen(screenName) {
+  if (screenName === "projects") bindProjects();
   if (screenName === "tickets") bindTickets();
   if (screenName === "solutions") bindSolutions();
   if (screenName === "submission") bindSubmission();
   if (screenName === "setup") bindSetup();
+}
+
+function bindProjects() {
+  document.querySelectorAll("[data-open-project]").forEach((card) => {
+    card.addEventListener("click", () => {
+      state.currentProject = card.dataset.openProject;
+      state.selectedTicketId = null;
+      state.expandedTicketId = null;
+      persistState();
+      renderScreen("tickets");
+    });
+  });
+  // "+ Add project" reuses the Setup tab's repository flow.
+  document.querySelector("[data-add-project]")?.addEventListener("click", () => renderScreen("setup"));
 }
 
 function bindTickets() {
@@ -952,11 +1054,12 @@ function bindSubmission() {
       repository: document.querySelector("#ticketRepository").value
     }).then(async (created) => {
       await syncTickets();
+      state.currentProject = document.querySelector("#ticketRepository")?.value || state.currentProject;
       state.selectedTicketId = null;
       state.expandedTicketId = created.key;
       state.selectedSolutionId = null;
       persistState();
-      renderScreen("tickets");
+      renderScreen("tickets");                        // lands inside the ticket's project workspace
     }).catch((err) => {
       button.dataset.state = ""; button.disabled = false; button.textContent = "Create ticket";
       alert("Could not create ticket: " + err.message);
@@ -1033,25 +1136,21 @@ document.addEventListener("click", (event) => {
 });
 
 window.addEventListener("hashchange", () => {
-  const route = window.location.hash.slice(1);
-  const normalized = routeAliases[route] || route;
-  if (screens[normalized] && normalized !== state.currentScreen) {
-    renderScreen(normalized, { updateHash: false });
-  }
+  const { screen, project } = parseRoute(window.location.hash.slice(1));
+  state.currentProject = project;
+  persistState();
+  renderScreen(screen, { updateHash: false });
 });
 
-const initialRoute = window.location.hash.slice(1);
-const normalizedInitialRoute = routeAliases[initialRoute] || initialRoute;
-if (normalizedInitialRoute === "solutions") {
+const initial = parseRoute(window.location.hash.slice(1));
+state.currentProject = initial.project;
+if (initial.screen === "solutions") {
   state.selectedTicketId = null;
   state.selectedSolutionId = null;
   state.deliveryChoice = "preview";
   persistState();
 }
 syncTickets().then(() => {
-  renderScreen(screens[normalizedInitialRoute] ? normalizedInitialRoute : "tickets", {
-    focus: false,
-    updateHash: !screens[normalizedInitialRoute]
-  });
+  renderScreen(initial.screen, { focus: false, updateHash: true });
   startPolling();
 });

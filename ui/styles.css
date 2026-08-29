@@ -1336,3 +1336,39 @@ code {
 .pr-table th { font-weight: 600; white-space: nowrap; }
 .pr-list { margin: 0.5rem 0 1rem; padding-left: 1.2rem; }
 .pr-list li { margin: 0.25rem 0; }
+
+/* ---- Projects dashboard ---- */
+.project-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+}
+.project-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 20px;
+  text-align: left;
+  border: 1px solid var(--line, #d6d9e0);
+  border-radius: 10px;
+  background: var(--surface, #fff);
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  transition: border-color 120ms ease, transform 120ms ease;
+}
+.project-card:hover, .project-card:focus-visible {
+  border-color: var(--cobalt, #2245d6);
+  transform: translateY(-1px);
+}
+.project-card__name { font-size: 1.05rem; }
+.project-card__desc { color: var(--ink-soft, #5a6072); font-size: 0.9rem; }
+.project-card__counts { margin-top: auto; font-size: 0.85rem; color: var(--ink-soft, #5a6072); font-variant-numeric: tabular-nums; }
+.project-card--add { border-style: dashed; justify-content: center; align-items: center; text-align: center; }
+.project-header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}

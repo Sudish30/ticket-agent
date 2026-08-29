@@ -56,7 +56,7 @@ lookup_codebase ──► analyze ──► (nothing left to ask) ──► buil
 | `ticket_agent/codebase.py` | `Codebase.open(spec)` — local dir or GitHub `owner/name[@ref]`; `files`, `tree_text()`, `read()`, `context_text(paths)`; `MAX_FILES=12`, `MAX_FILE_CHARS=6000` |
 | `ticket_agent/channels.py` | `Channel` Protocol `ask(key, contact, message) -> str`; `TerminalChannel`, `ScriptedChannel`, `JiraCommentChannel` |
 | `ticket_agent/jira_client.py` | `JiraClient` (Jira Cloud REST v3), `FakeJiraClient` (same duck type, against the Quorum backend's `/api/tickets` routes), `adf_to_text` (ADF → plain text), `load_mock_ticket` |
-| `quorum_backend/server.py` | FastAPI: JSON ticket store (`quorum_backend/tickets.json`, gitignored), comment thread, `POST /solve` (intake retry), `POST /solve-brief` (orchestrator on the stored brief → `pr_package`/`pr_package_md`), serves the Quorum UI at `/`; `POST …/open-pr` (real GitHub PR from the stored package via `github_pr.py`) |
+| `quorum_backend/server.py` | FastAPI: JSON ticket store (`quorum_backend/tickets.json`, gitignored), comment thread, `GET /api/tickets?repo=<name>` (project filter on the ticket's `repository` field), `GET /api/repos` (repos.json entries + orphan repository values, each with `ticket_count` + per-status `status_counts` — feeds the Projects dashboard), `POST /solve` (intake retry), `POST /solve-brief` (orchestrator on the stored brief → `pr_package`/`pr_package_md`), serves the Quorum UI at `/`; `POST …/open-pr` (real GitHub PR from the stored package via `github_pr.py`) |
 | `quorum_backend/github_pr.py` | `open_pr_from_package(pkg, remote, key)`: clone the GitHub remote, branch `agent/<key>-<slug>`, `git apply` the package's combined diff (`_retarget_new_files` rewrites `--- a/<path>` to `/dev/null` for files the run created — difflib doesn't), commit as "Ticket Agent", push, `gh pr create` → PR URL; all subprocess calls go through the patchable `_run` seam |
 | `repos.json` | repo mapping: name → `{path, github, default_branch}` (Notely: `demo_repo` ↔ `Sudish30/notely-demo`); `_repo_entry()` matches the entry whose `path` resolves to `REPO` |
 | `main.py` | argparse CLI; `--repo`; writes `brief.json` + `brief.md` (`--out` path with `.md`); `--post-brief` (with `--jira`) posts `brief.to_markdown()` on the ticket |
@@ -155,7 +155,11 @@ so swapping the human-in-the-loop transport never touches the graph.
 static files come from `QUORUM_UI_DIR` (default: the bundled `ui/` copy of the `wire-intake-agent` UI; point it at
 a live Quorum checkout when editing the UI) whose `app.js` is wired to these routes and polls every 3 s; its topbar **View as** toggle — Reporter / Engineer, `localStorage`
 `quorum-role` — hides solving controls, the brief and the Solutions tab from reporters, and the reply box from
-engineers). `POST /api/tickets` saves the ticket with status `Clarifying` and immediately starts `_run_agent` in a
+engineers). The home screen is a **Projects dashboard** (cards from `/api/repos`: name, description, status
+counts; "+ Add project" opens Setup); a card opens that project's Tickets/Solutions/Setup workspace filtered to
+its tickets (`visibleTickets()` matches `ticket.repository` against the project name), with a "← Projects" back
+header, and New ticket pre-selects the project's repo then lands in its workspace. Hash routes: `#projects`,
+`#project/<name>`, `#project/<name>/solutions|setup|submission`; legacy `#tickets` redirects to `#projects`. `POST /api/tickets` saves the ticket with status `Clarifying` and immediately starts `_run_agent` in a
 daemon thread (`_start_agent`); `POST …/solve` is only a manual retry, accepted when status is `Agent error` (or legacy
 `Ready`), else 409. `_run_agent` calls `run(ticket, JiraCommentChannel(FakeJiraClient("http://127.0.0.1:8000"), poll 2 s), repo=TICKET_AGENT_REPO)`
 — i.e. the agent talks to its own server over HTTP, posting questions as comments by `JIRA_AGENT_NAME` and waiting for

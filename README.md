@@ -50,7 +50,13 @@ threads, and serves the [Quorum](https://github.com/S-kalakota/Quorum) UI — th
 `ui/`, so a fresh clone serves the full web app with no extra setup (set `QUORUM_UI_DIR=/path/to/Quorum` to serve
 a live checkout while editing the UI).
 
-**New ticket** → the intake agent starts automatically (status **Clarifying**) and posts grounded questions in the
+The home screen is a **Projects dashboard** — one card per project (from `repos.json` via `GET /api/repos`) with
+its description and live ticket counts by status; opening a card enters that project's workspace (Tickets /
+Solutions / Setup, filtered to its tickets — `GET /api/tickets?repo=<name>`), with a back arrow to the dashboard.
+Hash routes: `#projects`, `#project/finpilot`, `#project/finpilot/solutions` (legacy `#tickets` redirects).
+Inside a project:
+
+**New ticket** (pre-selects the project's repo) → the intake agent starts automatically (status **Clarifying**) and posts grounded questions in the
 ticket's Clarification thread → reply as the reporter → the agent posts its sign-off → reply `confirm` → status
 **Brief ready** → the Engineer clicks **Start solving** (`POST /solve-brief`), which runs the orchestrator on the
 stored brief (status **Solving**) → status **PR ready** (package complete) or **Needs human review**, the PR

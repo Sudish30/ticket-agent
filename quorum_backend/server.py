@@ -83,8 +83,34 @@ class NewComment(BaseModel):
 # ---------------- ticket API (Jira-shaped enough for FakeJiraClient) ----------------
 
 @app.get("/api/tickets")
-def list_tickets():
-    return sorted(_load()["tickets"].values(), key=lambda t: t["created"], reverse=True)
+def list_tickets(repo: str | None = None):
+    """Optionally filtered to one project: /api/tickets?repo=finpilot (matches the ticket's repository field)."""
+    ts = sorted(_load()["tickets"].values(), key=lambda t: t["created"], reverse=True)
+    return [t for t in ts if repo is None or (t.get("repository") or "") == repo]
+
+
+@app.get("/api/repos")
+def list_repos():
+    """Projects for the dashboard: every repos.json entry (name, description, ...) plus any repository value
+    tickets use that repos.json does not know, each with ticket_count and per-status counts."""
+    repos: dict[str, dict] = {}
+    f = _HOME / "repos.json"
+    if f.is_file():
+        for name, entry in json.loads(f.read_text()).items():
+            repos[name] = {"name": name, "path": "", "github": "", "default_branch": "", "description": "", **entry}
+    tickets = list(_load()["tickets"].values())
+    for t in tickets:
+        r = t.get("repository") or ""
+        if r and r not in repos:                      # orphan project: tickets reference it, repos.json doesn't
+            repos[r] = {"name": r, "path": "", "github": "", "default_branch": "", "description": ""}
+    out = []
+    for name, entry in repos.items():
+        mine = [t for t in tickets if (t.get("repository") or "") == name]
+        counts: dict[str, int] = {}
+        for t in mine:
+            counts[t["status"]] = counts.get(t["status"], 0) + 1
+        out.append({**entry, "ticket_count": len(mine), "status_counts": counts})
+    return out
 
 @app.post("/api/tickets")
 def create_ticket(t: NewTicket):

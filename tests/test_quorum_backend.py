@@ -90,6 +90,35 @@ class QuorumBackend(unittest.TestCase):
         self.assertEqual(self.tc.get("/api/tickets/QT-001").json()["status"], "Brief ready")
         self.assertEqual(self.tc.get("/api/tickets/nope").status_code, 404)
 
+    def test_tickets_repo_filter(self):
+        self.tc.post("/api/tickets", json={"title": "a", "repository": "notely"})
+        self.tc.post("/api/tickets", json={"title": "b", "repository": "finpilot"})
+        self.tc.post("/api/tickets", json={"title": "c", "repository": "finpilot"})
+        self._wait_for_agent_calls(3)
+        self.assertEqual(len(self.tc.get("/api/tickets").json()), 3)              # no param = everything
+        fin = self.tc.get("/api/tickets", params={"repo": "finpilot"}).json()
+        self.assertEqual({t["summary"] for t in fin}, {"b", "c"})
+        self.assertTrue(all(t["repository"] == "finpilot" for t in fin))
+        self.assertEqual([t["summary"] for t in self.tc.get("/api/tickets?repo=notely").json()], ["a"])
+        self.assertEqual(self.tc.get("/api/tickets?repo=nope").json(), [])
+
+    def test_repos_dashboard_counts(self):
+        self.tc.post("/api/tickets", json={"title": "a", "repository": "finpilot"})
+        self.tc.post("/api/tickets", json={"title": "b", "repository": "finpilot"})
+        self.tc.post("/api/tickets", json={"title": "c", "repository": "someorphan"})
+        self._wait_for_agent_calls(3)
+        self.tc.post("/api/tickets/QT-002/status/PR%20ready")
+        repos = {r["name"]: r for r in self.tc.get("/api/repos").json()}
+        self.assertIn("notely", repos)                                            # repos.json entry, 0 tickets
+        self.assertTrue(repos["notely"]["description"])
+        self.assertEqual(repos["notely"]["ticket_count"], 0)
+        fin = repos["finpilot"]
+        self.assertEqual(fin["github"], "Sudish30/Finpilot")
+        self.assertEqual(fin["ticket_count"], 2)
+        self.assertEqual(fin["status_counts"], {"Clarifying": 1, "PR ready": 1})
+        orphan = repos["someorphan"]                                              # grouped even without repos.json
+        self.assertEqual((orphan["ticket_count"], orphan["description"]), (1, ""))
+
     def test_solve_brief_requires_brief_ready(self):
         self.assertEqual(self.tc.post("/api/tickets/QT-404/solve-brief").status_code, 404)
         self.tc.post("/api/tickets", json={"title": "t"})
